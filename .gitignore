@@ -1,0 +1,9 @@
+data/
+models/*.pkl
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+proj_development*.ipynb
+gridstatus_import.ipynb
+ercot_key.txt
