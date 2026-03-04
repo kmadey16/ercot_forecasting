@@ -18,8 +18,9 @@ import os
 import glob
 from pathlib import Path
 
-base = '/Users/kamilmadey/Desktop/ercot_forecasting_project/data/raw/'
-interim = '/Users/kamilmadey/Desktop/ercot_forecasting_project/data/interim/'
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+base = BASE_DIR / 'data' / 'raw'
+interim = BASE_DIR / 'data' / 'interim'
 
 def fix_hour24_helper(df, date_col, hour_col):
     df[hour_col] = df[hour_col].astype(str).str.strip().str.replace(':00', '')
@@ -364,40 +365,40 @@ def preprocess_pipeline():
     """
     
     # Clean individual datasets 
-    rt_lmp = clean_RT_data(glob.glob(base + '*RT_prices*.csv'))
-    rt_lmp.to_parquet(interim + 'rt_cleaned.parquet')
+    rt_lmp = clean_RT_data(glob.glob(str(base / '*RT_prices*.csv')))
+    rt_lmp.to_parquet(interim / 'rt_cleaned.parquet')
     del rt_lmp
 
-    dam_lmp = clean_DAM_data(glob.glob(base + '*DAM_prices*.csv'))
-    dam_lmp.to_parquet(interim + 'DAM_cleaned.parquet')     
+    dam_lmp = clean_DAM_data(glob.glob(str(base / '*DAM_prices*.csv')))
+    dam_lmp.to_parquet(interim / 'DAM_cleaned.parquet')     
     del dam_lmp
 
-    prc = clean_prc(pre_rtcb_dir= base + 'ercot_archive/', post_rtcb_filepath= base + 'ercot_archive/post_prc.csv')
-    prc.to_parquet(interim + 'prc_cleaned.parquet')
+    prc = clean_prc(pre_rtcb_dir= base / 'ercot_archive/', post_rtcb_filepath= base / 'ercot_archive/post_prc.csv')
+    prc.to_parquet(interim / 'prc_cleaned.parquet')
     del prc
 
-    load = clean_load_data(glob.glob(base + '*load_data*.csv'))  
-    load.to_parquet(interim + 'load_cleaned.parquet') 
+    load = clean_load_data(glob.glob(str(base / '*load_data*.csv')))
+    load.to_parquet(interim / 'load_cleaned.parquet') 
     del load
 
     weather = fetch_weather_data()
-    weather.to_parquet(interim + 'weather_cleaned.parquet')   
+    weather.to_parquet(interim / 'weather_cleaned.parquet')   
     del weather
 
-    outages = clean_outages_data(glob.glob(base + '*outages*.csv'))
-    outages.to_parquet(interim + 'outages_cleaned.parquet') 
+    outages = clean_outages_data(glob.glob(str(base / '*outages*.csv')))
+    outages.to_parquet(interim / 'outages_cleaned.parquet') 
     del outages
 
-    solar = clean_solar(glob.glob(base + '*solar*.csv'))
-    solar.to_parquet(interim + 'solar_cleaned.parquet') 
+    solar = clean_solar(glob.glob(str(base / '*solar*.csv')))
+    solar.to_parquet(interim / 'solar_cleaned.parquet') 
     del solar
 
-    wind = clean_wind_data(glob.glob(base + '*wind*.csv'))
-    wind.to_parquet(interim + 'wind_cleaned.parquet') 
+    wind = clean_wind_data(glob.glob(str(base / '*wind*.csv')))
+    wind.to_parquet(interim / 'wind_cleaned.parquet') 
     del wind
 
-    fcst = clean_fcst_data(glob.glob(base + '*load_fcst_data*.csv'))
-    fcst.to_parquet(interim + 'fcst_cleaned.parquet') 
+    fcst = clean_fcst_data(glob.glob(str(base / '*load_fcst_data*.csv')))
+    fcst.to_parquet(interim / 'fcst_cleaned.parquet')
     del fcst
     
     
@@ -407,14 +408,14 @@ def preprocess_pipeline():
     hour_ending_files = ['rt_cleaned', 'DAM_cleaned', 'load_cleaned', 'outages_cleaned', 'solar_cleaned', 'wind_cleaned', 'fcst_cleaned']
 
     for f in ['rt_cleaned', 'DAM_cleaned', 'load_cleaned', 'weather_cleaned', 'outages_cleaned', 'solar_cleaned', 'wind_cleaned', 'fcst_cleaned', 'prc_cleaned']:
-        df = pd.read_parquet(interim + f + '.parquet')
+        df = pd.read_parquet(interim / (f + '.parquet'))
         if f in hour_ending_files:
             df['timestamp'] = df['timestamp'] - pd.Timedelta(hours=1)
         merged = merged.merge(df, on='timestamp', how='left')
         del df
 
     merged['RT_DAM_spread'] = merged['RT_price'] - merged['DAM_price']
-    merged.to_parquet(interim + 'merged_all_data.parquet')
+    merged.to_parquet(interim / 'merged_all_data.parquet')
     
     return merged
 
