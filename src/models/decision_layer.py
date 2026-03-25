@@ -4,22 +4,22 @@ import numpy as np
 
 # Mining backtest
 
-def mining_backtest(test_df, preds_df, scarcity_threshold, tight_threshold, capacity_mw = 200, mining_revenue_per_mwh=40,verbose=True):
+def mining_backtest(test_df, predicted_prc, tight_threshold, scarcity_threshold=3000, capacity_mw = 200, mining_revenue_per_mwh=40,verbose=True):
      #mining_rev_per_mwh: $/MWh mining income
      #capacity_mw: miner size in MW
 
      results = test_df[['timestamp', 'RT_price']].copy()
-     results['prob_Scarcity'] = preds_df['prob_Scarcity'].values
-     results['prob_Tight'] = preds_df['prob_Tight'].values
+     results['predicted_prc'] = predicted_prc
 
      #Cost for always-on
      results['always_on_cost'] = (results['RT_price'] - mining_revenue_per_mwh) * capacity_mw
 
      #Model guided suggestions curtailing during tight/scarcity
-     results['guided_cost'] = (results['RT_price'] - mining_revenue_per_mwh) * capacity_mw
+     results['guided_cost'] = results['always_on_cost'].copy()
      
-     results.loc[results['prob_Scarcity'] > scarcity_threshold, 'guided_cost'] = 0
-     results.loc[ (results['prob_Scarcity'] <= scarcity_threshold) & (results['prob_Tight'] > tight_threshold), 'guided_cost' ] = 0
+
+     results.loc[results['predicted_prc'] < scarcity_threshold, 'guided_cost'] = 0
+     results.loc[(results['predicted_prc'] >= scarcity_threshold) & (results['predicted_prc'] < tight_threshold), 'guided_cost'] = 0
      
      #savings
      total_always_on = results['always_on_cost'].sum()
@@ -39,13 +39,12 @@ def mining_backtest(test_df, preds_df, scarcity_threshold, tight_threshold, capa
 
 # datacenter backtest
 
-def datacenter_backtest(test_df, preds_df, scarcity_threshold, tight_threshold, critical_pct=0.65, capacity_mw=200, curtailment_penalty=50,verbose=True):
+def datacenter_backtest(test_df, predicted_prc, tight_threshold=5000,scarcity_threshold=3000,critical_pct=0.65, capacity_mw=200, curtailment_penalty=50, verbose=True):
      #Critical_pct: percentage of critical load
      #capacity_mw:  datacenter size in MW
 
      results = test_df[['timestamp', 'RT_price']].copy()
-     results['prob_Scarcity'] = preds_df['prob_Scarcity'].values
-     results['prob_Tight'] = preds_df['prob_Tight'].values
+     results['predicted_prc'] = predicted_prc
 
      flexible_capacity_pct = 1 - critical_pct
 
@@ -54,8 +53,8 @@ def datacenter_backtest(test_df, preds_df, scarcity_threshold, tight_threshold, 
 
      # Model guided using prob
      results['guided_load'] = capacity_mw  # default full power
-     results.loc[results['prob_Scarcity'] > scarcity_threshold, 'guided_load'] = capacity_mw * critical_pct  # cut all flexible (scarcity)
-     results.loc[ (results['prob_Scarcity'] <= scarcity_threshold) & (results['prob_Tight'] > tight_threshold), 'guided_load' ] = capacity_mw * (critical_pct + flexible_capacity_pct * 0.5)  # cut half flexible (tight)
+     results.loc[results['predicted_prc'] < scarcity_threshold,'guided_load'] = capacity_mw * critical_pct  # cut all flexible load (scarcity)
+     results.loc[(results['predicted_prc'] >= scarcity_threshold) & (results['predicted_prc'] < tight_threshold),'guided_load'] = capacity_mw * (critical_pct + flexible_capacity_pct * 0.5)  # cut half flexible (tight)
 
      reduced_mw = capacity_mw - results['guided_load']
      
@@ -76,17 +75,19 @@ def datacenter_backtest(test_df, preds_df, scarcity_threshold, tight_threshold, 
 
 
 # Optimize Thresholds
-def optimize_thresholds(val_df, val_preds, backtest_fn, capacity_mw=200, verbose=False, **kwargs):
+def optimize_thresholds(val_df, predicted_prc, backtest_fn, capacity_mw=200, verbose=False, **kwargs):
      best_savings = 0
      best_params = {}
 
-     for s_threshold in np.arange(0.05, 0.55, 0.05):
-          for t_threshold in np.arange(0.05, 0.55,0.05):
-               results = backtest_fn(val_df, val_preds, capacity_mw=capacity_mw, scarcity_threshold=s_threshold, tight_threshold=t_threshold,verbose=verbose, **kwargs)
+     for s_threshold in range(2000, 4500, 250):
+          for t_threshold in range(4000,7000,250):
+               if t_threshold <= s_threshold:
+                    continue
+               results = backtest_fn(val_df, predicted_prc, capacity_mw=capacity_mw, scarcity_threshold=s_threshold, tight_threshold=t_threshold,verbose=verbose, **kwargs)
                savings = results['always_on_cost'].sum() - results['guided_cost'].sum()
 
                if savings > best_savings:
                     best_savings = savings
-                    best_params = {'scarcity': s_threshold, 'tight': t_threshold}
+                    best_params = {'tight_threshold': t_threshold, 'scarcity_threshold': s_threshold}
      
      return best_params, best_savings

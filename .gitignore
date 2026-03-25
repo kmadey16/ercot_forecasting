@@ -1,8 +1,8 @@
-data/
+data/raw/
+data/interim/
+data/processed/
 venv/
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
-proj_development*.ipynb
-gridstatus_import.ipynb
-ercot_key.txt.DS_Store
+.env
+.DS_Store

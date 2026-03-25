@@ -401,7 +401,6 @@ def preprocess_pipeline():
     fcst.to_parquet(interim / 'fcst_cleaned.parquet')
     del fcst
     
-    
     # STEP 5: Merge everything
     date_range = pd.date_range(start='2021-01-01 00:00:00', end='2025-12-31 23:00:00', freq='h')
     merged = pd.DataFrame({'timestamp': date_range})

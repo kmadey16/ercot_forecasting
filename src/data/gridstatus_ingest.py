@@ -3,7 +3,9 @@ from gridstatus import Ercot
 from pathlib import Path
 
 #Config
-RAW_DIR = Path("data/raw/gridstatus")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+RAW_DIR = PROJECT_ROOT / 'data' / 'raw' / 'gridstatus'
+
 settlement_point = 'HB_WEST'
 
 # Pull functions (new data)

@@ -1,141 +1,152 @@
-# ERCOT Grid Regime Classification
+# ERCOT Grid Reserve Forecasting for Flexible Load Dispatch
 
-Predicting ERCOT grid stress conditions to optimize flexible load dispatch for Bitcoin miners, datacenters, and battery storage operators.
+Predicts ERCOT Physical Responsive Capability (PRC) to guide curtailment decisions for Bitcoin mining and AI datacenter operations in West Texas.
 
-## Problem
+## What This System Does
 
-Electricity prices in ERCOT are volatile — prices sit near $20-50/MWh most hours, then spike to $200-9,000/MWh during grid stress events. Flexible load operators (Bitcoin miners, datacenters, batteries) need to know **when** these spikes will happen so they can curtail operations and avoid buying expensive power — or sell power back to the grid at premium rates.
+Forecasts grid reserve levels (PRC in MW) at 1-hour and 24-hour horizons, then uses economically optimized thresholds to recommend when flexible load operators should curtail. Evaluated against real-time prices at HB_WEST to quantify dollar savings.
 
-![RT Price Over Time](images/rt_price_over_time.png)
+**Three-layer architecture:**
+- **Model Layer** Predicts PRC value. Stable across time periods and market redesigns.
+- **Regime Labels** Translates PRC into human-readable grid state (Scarcity/Tight/Normal/Surplus). Fixed, physics-based boundaries for operator communication.
+- **Decision Layer** Finds the economically optimal curtailment threshold. Adapts to changing grid conditions without retraining the model.
 
-Predicting exact prices is noisy and hard. Instead, this project classifies grid conditions into four **regimes** that map directly to dispatch actions:
+## What It Doesn't Do
 
-| Regime | Price Range | Action |
-|--------|-----------|--------|
-| **Low** | ≤ $0/MWh | Full power — cheap/negative prices, maximize consumption |
-| **Normal** | $0–75/MWh | Operate — standard operations |
-| **Tight** | $75–200/MWh | Reduce — lower non-critical load |
-| **Scarcity** | > $200/MWh | Curtail — shut down flexible load, sell power back |
+This is a grid stress timing model, not a price forecaster. PRC predicts system-wide reserve levels, not local price. Congestion-driven price spikes at HB_WEST can occur during comfortable reserve levels. A price model conditioned on PRC would capture this — that's a planned enhancement.
 
-## Approach
+## Results
 
-Two LightGBM classifiers built for different planning horizons:
+### Model Performance
 
-**1-Hour Ahead Model** — Real-time dispatch decisions
-- F1: 0.91 | Tight Recall: 0.78 | Scarcity Recall: 0.32
-- Primary use: battery arbitrage, BTC mining real-time curtailment
-- Top features: RT price lag (1h), wind ramp rates, windspeed, load ramp
+| Horizon | Model | Holdout MAE | CV Scarcity Recall | Use Case |
+|---------|-------|-------------|-------------------|----------|
+| 1h | LR + LGBM Ensemble | 587 MW | 41% | Real-time curtailment |
+| 24h | Linear Regression | 1,359 MW | 8% | Next-day scheduling |
 
-**24-Hour Ahead Model** — Day-ahead planning
-- F1: 0.86 | Tight Recall: 0.67 | Scarcity Recall: 0.20
-- Primary use: datacenter workload scheduling, DAM bidding, mining operations planning
-- Top features: wind forecast (STWPF), DAM price, RT price rolling stats, outages
+### Backtest — Economic Value (200 MW operation)
 
-## Business Value — Backtest Results (2025)
+| Period | Use Case | Horizon | Savings | Hours Curtailed | Tight Threshold |
+|--------|----------|---------|---------|-----------------|-----------------|
+| 2025 | Mining | 1h | $1.0M | 166 / 8,401 | 6,750 MW |
+| 2025 | Mining | 24h | $282K | 49 / 8,401 | 6,750 MW |
+| 2025 | Datacenter | 1h | $35K | 40 / 8,401 | 6,250 MW |
+| 2025 | Datacenter | 24h | $15K | 25 / 8,401 | 6,500 MW |
+| 2022 | Mining | 1h | $25.3M | 1,764 / 2,594 | 4,750 MW |
+| 2022 | Mining | 24h | $24.4M | 1,566 / 2,594 | 4,750 MW |
+| 2022 | Datacenter | 1h | $7.4M | 1,572 / 2,594 | 4,500 MW |
+| 2022 | Datacenter | 24h | $7.2M | 1,566 / 2,594 | 4,750 MW |
 
-Using a 200MW facility on 2025 test data:
-
-| Operator | Model | Always-On Cost | Model-Guided Cost | Savings |
-|----------|-------|---------------|-------------------|---------|
-| BTC Miner | 1h | $57.7M | $40.2M | **$17.5M** |
-| BTC Miner | 24h | $57.7M | $41.2M | **$16.5M** |
-| Datacenter | 1h | $57.7M | $54.2M | **$3.5M** |
-| Datacenter | 24h | $57.7M | $54.6M | **$3.1M** |
-
-Datacenter savings are lower because only flexible load (35%) is curtailed — critical infrastructure stays online.
-
-## Data
-
-5 years of ERCOT market data (2021–2025), ~43,000 hourly observations:
-
-- **RT & DAM prices** — HB_WEST hub (Selenium scraper + ERCOT API)
-- **System load** — West zone + system total actual and forecast
-- **Wind generation** — West zone WGRPP, STWPF, COP_HSL + system-wide
-- **Solar generation** — System-wide PVGRPP, STPPF, COP_HSL
-- **Outages** — Zonal and system-wide planned/forced outages
-- **Weather** — Temperature, humidity, windspeed, precipitation (Open-Meteo API, Midland TX)
-
-## Feature Engineering
-
-67 features built from raw data:
-
-- **Time features**: Hour, day of week, month, weekend flag, cyclic encoding (sin/cos)
-- **Price lags**: RT and DAM at 1h, 24h, 168h horizons
-- **Rolling statistics**: 6h and 24h rolling mean/std for prices, load, wind
-- **Ramp rates**: Hour-over-hour change in load, wind, RT price
-- **Engineered signals**: Net load (demand minus renewables), renewable penetration ratio
-- **Data quality**: Outlier capping at 99th percentile, forward/backfill for sparse nulls
-
-## Model Selection
-
-Three classifiers compared with default hyperparameters, then the winner (LightGBM) tuned via GridSearchCV with TimeSeriesSplit:
-
-| Model | Weighted F1 | Scarcity Recall | Tight Recall |
-|-------|------------|-----------------|--------------|
-| Logistic Regression | 0.82 | 0.18 | 0.04 |
-| Random Forest | 0.92 | 0.06 | 0.33 |
-| **LightGBM** | **0.93** | **0.18** | **0.53** |
-
-After tuning with `class_weight='balanced'` and removing Uri from 1h training:
-
-| Model | Weighted F1 | Scarcity Recall | Tight Recall |
-|-------|------------|-----------------|--------------|
-| **1h (final)** | **0.91** | **0.32** | **0.78** |
-| **24h (final)** | **0.86** | **0.20** | **0.67** |
-
-![Confusion Matrices](images/confusion_matrices.png)
-
-![1h Feature Importance](images/feature_importance_1h.png)
-
-## Key Findings
-
-- **No single feature predicts grid stress** — it's the combination of high load + low wind + outages. Tree-based models capture these interactions automatically.
-- **Wind and solar suppress prices non-linearly** — low correlation with RT price doesn't mean they're useless features. LightGBM picks up threshold effects that linear models miss.
-- **Winter Storm Uri (Feb 2021) added noise** — removing it from 1h training improved scarcity recall. The extreme patterns (frozen generators, $9,000 cap prices) don't generalize to typical scarcity events.
-- **Most scarcity misses are classified as Tight, not Normal** — the model fails gracefully. Even when it underestimates severity, it still triggers load reduction.
-- **1h model relies on price momentum, 24h model shifts to fundamentals** — mirrors how traders shift from technical to fundamental analysis as the horizon extends.
-- **Scarcity detection is fundamentally limited** by sample size (~200 hours in 5 years). In production, supplement with ERCOT operational alerts.
+**Key insight:** Decision thresholds must be calibrated to current grid conditions. The model predicts PRC, and the decision layer adapts thresholds to the operating environment. 2022 tight threshold: 4,750 MW. 2025 tight threshold: 6,750 MW.
 
 ## Project Structure
 
 ```
-ercot_forecasting_project/
+ercot_forecasting/
+├── data/
+│   ├── raw/                          # Raw data files (not tracked)
+│   ├── interim/                      # Cleaned individual datasets
+│   └── processed/                    # model_ready.parquet
+├── models/
+│   ├── lr_1h_prc.pkl                 # 1h Linear Regression
+│   ├── lgbm_1h_residual.pkl          # 1h LightGBM residual correction
+│   ├── lr_24h_prc.pkl                # 24h Linear Regression
+│   └── thresholds.json               # Optimized decision thresholds
+├── notebooks/
+│   ├── 01_eda_price_based.ipynb      # Original RT price exploration
+│   ├── 01_eda_prc.ipynb              # PRC exploration and regime analysis
+│   ├── 02_modeling_prc.ipynb         # PRC regression modeling + backtest
+│   └── 03_modeling_price_based.ipynb # Original price-based classification
 ├── src/
 │   ├── data/
-│   │   ├── preprocess.py              # Data cleaning pipeline
-│   │   ├── import_Ercot_historical_data.py  # Selenium scraper (2021+)
-│   │   └── gridstatus_import.py       # GridStatus API (2023+, production)
+│   │   ├── gridstatus_ingest.py      # Data ingestion (backfill + going-forward)
+│   │   └── preprocess.py             # Cleaning and merging
 │   ├── features/
-│   │   └── feature_engineering.py     # Feature building pipeline
+│   │   └── feature_engineering.py    # Feature building pipeline
 │   └── models/
-│       ├── predict.py                 # Production prediction
-│       └── decision_layer.py          # Dispatch logic + backtesting
-├── notebooks/
-│   ├── 01_eda.ipynb                   # Exploratory data analysis
-│   └── 02_modeling.ipynb              # Model training + evaluation
-├── models/                            # Saved model artifacts (.pkl)
-├── data/                              # Raw, interim, processed (not in repo)
+│       ├── decision_layer.py         # Backtest and threshold optimization
+│       └── predict.py                # Production prediction script
 ├── README.md
 └── .gitignore
 ```
 
-## How It Works — Production Flow
+## How to Run
 
-1. **Ingest** — Pull latest ERCOT data via GridStatus API
-2. **Clean** — `preprocess.py` standardizes timestamps, handles hour-24, deduplicates forecast vintages
-3. **Features** — `feature_engineering.py` builds lags, rolling stats, ramp rates, regime labels
-4. **Predict** — `predict.py` loads saved models, outputs regime forecast per hour
-5. **Dispatch** — `decision_layer.py` maps regimes to operator-specific actions
+### 1. Data Pipeline
+
+```bash
+# Backfill historical prices (gridstatus open source)
+python src/data/gridstatus_ingest.py
+
+# Preprocess raw data → interim
+python src/data/preprocess.py
+
+# Build features → processed/model_ready.parquet
+python src/features/feature_engineering.py
+```
+
+Historical Selenium-scraped data (2021-2025) is required in `data/raw/` for preprocessing. Post-RTC+B PRC data requires a GridStatus.io API key in `.env`.
+
+### 2. Modeling
+
+Run `notebooks/02_modeling_prc.ipynb` end-to-end. Saves trained models to `models/` and optimized thresholds to `models/thresholds.json`.
+
+### 3. Prediction
+
+```bash
+python src/models/predict.py
+```
+
+Loads saved models and thresholds, predicts PRC for each hour, outputs dispatch recommendations.
+
+## Modeling Approach
+
+### Model Evolution
+
+The project began with RT price forecasting at HB_WEST. Price proved too volatile — driven by bidding behavior, congestion, and market structure 
+rather than predictable physical fundamentals. The pivot to PRC was motivated by two insights:
+
+### Why PRC, Not Price
+1. Price is a *result* of grid conditions, not a direct indicator of stress
+2. ERCOT's December 2025 RTC+B market redesign changed the entire pricing 
+   mechanism — price-based labels broke at the boundary, PRC did not.
+
+The full progression is documented across the notebooks:
+
+1. **RT Price Regression** (`01_eda_price_based.ipynb`, `02_modeling_price_based.ipynb`) — too volatile
+2. **Price-Based Classification** (`02_modeling_price_based.ipynb`) — labels broke at RTC+B
+3. **PRC Classification** — concept drift from grid capacity growth
+4. **PRC Regression + Ensemble** (`02_modeling_prc.ipynb`) — final architecture
+
+### Scarcity Detection
+
+41% scarcity recall (1h model). Missed scarcity events are classified as Tight, not Normal — the model fails gracefully. Operators curtail during both Scarcity and Tight conditions, so the dispatch decision is often correct even when the regime label is wrong.
+
+Scarcity detection evaluated via cross-validation on 2021-2023 data where events exist. The 2025 holdout has zero scarcity events due to grid capacity growth.
+
+## Data Sources
+
+- **gridstatus** (open source): load, wind, solar, outages, load forecasts, RT/DAM prices
+- **GridStatus.io** (API): post-RTC+B PRC data (Dec 5, 2025+)
+- **ERCOT archive xlsx**: pre-RTC+B PRC (2021 - Dec 4, 2025)
+- **Open-Meteo API**: weather data for Midland, TX (West Texas hub)
+- **Settlement point**: HB_WEST
+
+## Production Roadmap
+
+- **Threshold recalibration**: rerun `optimize_thresholds()` monthly/quarterly on recent data. Grid conditions evolve — what counts as economically worth curtailing shifts with capacity growth.
+- **Model retraining**: retrain when MAE degrades significantly. PRC physics are stable but the distribution shifts as the grid grows.
+- **Going-forward data**: `pull_new_data()` in `gridstatus_ingest.py` collects all datasets. Run weekly.
+- **ORDC price adders**: post-RTC+B adder data (RTRDPA) collected but not yet integrated as features. Potential improvement for scarcity detection.
+
+## Future Enhancements
+
+- **Probability calibration**: isotonic regression on ensemble predictions for calibrated confidence intervals
+- **Congestion features**: WESTEX binding constraints from `get_active_constraints()` to capture local price spikes independent of system-wide reserves
+- **Battery state-of-charge tracking**: extend decision layer with charge/discharge cycles and efficiency losses
+- **Structural capacity features**: rolling max wind/solar capacity as proxies for grid buildout trend
+- **Price model conditioned on PRC**: separate model predicting RT price given PRC level, hour, and load conditions
 
 ## Tech Stack
 
-Python, Pandas, LightGBM, scikit-learn, Matplotlib, Selenium, Open-Meteo API, GridStatus
-
-## Future Work
-
-- Battery storage backtest with charge state tracking and round-trip efficiency
-- Streamlit dashboard for real-time regime visualization
-- Automated daily pipeline via GitHub Actions
-- Incorporate ERCOT operational alerts (EEA levels, operating reserves) as leading indicators
-- Expand training data to 10+ years for better rare event detection
-- Two-stage binary classification (Normal vs Stress → Tight vs Scarcity)
+Python, scikit-learn (Linear Regression), LightGBM, pandas, gridstatus, GridStatus.io API, Open-Meteo API, joblib

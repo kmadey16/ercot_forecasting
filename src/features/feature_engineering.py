@@ -2,35 +2,39 @@ import pandas as pd
 import numpy as np
 import os
 import datetime as dt
+from pathlib import Path
 
-PROJECT_ROOT = '/Users/kamilmadey/Desktop/ercot_forecasting_project/'
-INTERIM_DIR = os.path.join(PROJECT_ROOT, 'data', 'interim')
-PROCESSED_DIR = os.path.join(PROJECT_ROOT, 'data', 'processed')
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+INTERIM_DIR = PROJECT_ROOT / 'data' / 'interim'
+PROCESSED_DIR = PROJECT_ROOT / 'data' / 'processed'
+
 
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
 def load_data():
-    df = pd.read_parquet(INTERIM_DIR + '/merged_all_data.parquet')
+    df = pd.read_parquet(INTERIM_DIR / 'merged_all_data.parquet')
     return df
 
 
 # Need to fix the data quality issues found in EDA
 def fix_data_quality(df):
-    for col in ['WGRPP_LZ_WEST', 'PVGRPP_SYSTEM_WIDE']:
-        cap = df[col].quantile(0.99)
-        df[col] = df[col].clip(upper=cap)
 
     # Drop duplicate timestamps
     df = df.drop_duplicates(subset='timestamp', keep='first')
 
+    # Drop flagged col
+    df = df.drop(columns=['TotalResourceMWZoneWest'], errors='ignore')
+
+    # Cap wind solar to fix bad data -- Limit to ERCOTs installed capacity
+    df.loc[df['WGRPP_SYSTEM_WIDE'] > 45000, 'WGRPP_SYSTEM_WIDE'] = np.nan
+    df.loc[df['PVGRPP_SYSTEM_WIDE'] > 25000, 'PVGRPP_SYSTEM_WIDE'] = np.nan
+    df.loc[df['WGRPP_LZ_WEST'] > 25000, 'WGRPP_LZ_WEST'] = np.nan
+
     # Forward fill the small gaps for prices and load (the few nulls we saw in EDA)
-    df[['RT_price','DAM_price' ,'hub_load', 'load_total']] = df[['RT_price','DAM_price' ,'hub_load', 'load_total']].ffill()
+    df[['RT_price','DAM_price' ,'hub_load', 'load_total','COP_HSL_SYSTEM_WIDE']] = df[['RT_price','DAM_price' ,'hub_load', 'load_total','COP_HSL_SYSTEM_WIDE']].ffill().bfill()
 
-    # Backfill Outage nulls for West (For non tree based models) 
-    df['TotalResourceMWZoneWest'] = df['TotalResourceMWZoneWest'].bfill()
-
-    # Drop trivial nulls (5-20 rows)
-    df = df.dropna(subset=['PVGRPP_SYSTEM_WIDE', 'WGRPP_LZ_WEST', 'West']).copy()
+    # Drop trivial nulls (5-20 rows) 
+    df = df.dropna(subset=['PVGRPP_SYSTEM_WIDE', 'WGRPP_LZ_WEST', 'PRC']).copy()
 
     #Recalc DA RT Spread
     df['RT_DAM_spread'] = df['RT_price'] - df['DAM_price']
@@ -70,6 +74,10 @@ def add_lag_features(df):
     df['wind_24h_lag'] = df['WGRPP_LZ_WEST'].shift(24)
     df['wind_168h_lag'] = df['WGRPP_LZ_WEST'].shift(168)
 
+    # PRC lags — discovered during modeling as the single biggest improvement (65% MAE reduction) - Uncomment in prod
+    #df['PRC_1h_lag'] = df['PRC'].shift(1)
+    #df['PRC_24h_lag'] = df['PRC'].shift(24)
+    #df['PRC_168h_lag'] = df['PRC'].shift(168)
     return df
 
 # Rolling stats of lagged prices/load/wind (these cols because they are volatile with repeating patterns)
@@ -85,7 +93,11 @@ def add_rolling_stats(df):
 # Add in engineered features (net load, renewable penetration, ramp rates)
 
 def add_engineered_features(df):
-    
+
+    # Add renewable forecast error
+    df['wind_forecast_error'] = df['WGRPP_LZ_WEST'] - df['STWPF_LZ_WEST']
+    df['solar_forecast_error'] = df['PVGRPP_SYSTEM_WIDE'] - df['STPPF_SYSTEM_WIDE']
+
     #Net load = demand after renewables (two versions due to data limits)
     df['net_load_system'] = df['load_total'] - df['WGRPP_SYSTEM_WIDE'] - df['PVGRPP_SYSTEM_WIDE']
     df['net_load_west'] = df['hub_load'] - df['WGRPP_LZ_WEST'] #No data for WEST hub solar
@@ -93,6 +105,9 @@ def add_engineered_features(df):
     # Renewable penetration -system wide and WEST-
     df['renewable_pct_system'] = (df['WGRPP_SYSTEM_WIDE'] + df['PVGRPP_SYSTEM_WIDE']) / df['load_total']
     df['renewable_pct_west'] = df['WGRPP_LZ_WEST'] / df['hub_load']
+
+    #Track increasing PRC over time
+    df['days_since_start'] = (df['timestamp'] - df['timestamp'].min()).dt.days
 
     #Ramp rates (track hour over hour changes)
     df['load_total_ramp'] = df['load_total'].diff()
@@ -105,11 +120,9 @@ def add_engineered_features(df):
 
 # Add regime labels
 def add_regime_labels(df):
-    regime_conditions = [df['RT_price'] <= 0, (df['RT_price'] > 0) & (df['RT_price'] <= 75), (df['RT_price'] > 75) & (df['RT_price'] <= 200), df['RT_price'] > 200]
-    labels = ['Low', 'Normal', 'Tight', 'Scarcity']
-
-    df['regime'] = np.select(regime_conditions,labels, default='Unknown')
-
+    bins = [0, 3000, 5000, 10000, float('inf')]
+    labels = ['Scarcity', 'Tight', 'Normal', 'Surplus']
+    df['regime'] = pd.cut(df['PRC'], bins=bins, labels=labels)
     return df
 
 
@@ -122,10 +135,10 @@ def feature_engineering_pipeline():
     df = add_engineered_features(df)
     df = add_regime_labels(df)
 
-    # Drop nulls from lagged features
-    df = df.dropna().reset_index(drop=True)
+    # Drop lag warmup rows (first 168 hours)
+    df = df.iloc[168:].reset_index(drop=True)
 
-    df.to_parquet(PROCESSED_DIR + '/model_ready.parquet')
+    df.to_parquet(PROCESSED_DIR / 'model_ready.parquet')
 
     return df
 
