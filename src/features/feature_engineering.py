@@ -22,8 +22,11 @@ def fix_data_quality(df):
     # Drop duplicate timestamps
     df = df.drop_duplicates(subset='timestamp', keep='first')
 
-    # Drop flagged col
-    df = df.drop(columns=['TotalResourceMWZoneWest'], errors='ignore')
+    # Keep TotalResourceMWZoneWest — West zone generator outage capacity is a direct
+    # congestion signal (less local generation → more imports → higher local prices).
+    # Previously dropped; reinstated for the price model. ~3,500 nulls in early 2021
+    # when zone-level data wasn't published — left as NaN so LGBM handles natively
+    # (it can split on missing values). Do NOT dropna or ffill — preserves training rows.
 
     # Cap wind solar to fix bad data -- Limit to ERCOTs installed capacity
     df.loc[df['WGRPP_SYSTEM_WIDE'] > 45000, 'WGRPP_SYSTEM_WIDE'] = np.nan
@@ -39,6 +42,14 @@ def fix_data_quality(df):
     #Recalc DA RT Spread
     df['RT_DAM_spread'] = df['RT_price'] - df['DAM_price']
 
+    # DAM congestion spread: how much more expensive HB_WEST clears vs system average.
+    # Positive = DAM already expects congestion into West Texas. This is known 24h ahead
+    # (DAM clears day-ahead) and is the most direct forward-looking congestion signal.
+    if 'DAM_system' in df.columns:
+        df['DAM_congestion_spread'] = df['DAM_price'] - df['DAM_system']
+    else:
+        df['DAM_congestion_spread'] = np.nan
+
     return df
 
 # Feature building - time based (hour,day,month,weekend,cyclic)
@@ -51,6 +62,11 @@ def add_time_features(df):
 
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+
+    # RTC+B market redesign flag (Dec 5, 2025). Pre-RTC+B PRC and adder data
+    # come from ERCOT xlsx archives; post comes from GridStatus.io API.
+    # The flag lets the model learn any systematic level shift between the two regimes.
+    df['is_pre_rtcb'] = (df['timestamp'] < pd.Timestamp('2025-12-05')).astype(int)
 
     return df
 
@@ -74,10 +90,27 @@ def add_lag_features(df):
     df['wind_24h_lag'] = df['WGRPP_LZ_WEST'].shift(24)
     df['wind_168h_lag'] = df['WGRPP_LZ_WEST'].shift(168)
 
-    # PRC lags — discovered during modeling as the single biggest improvement (65% MAE reduction) - Uncomment in prod
-    #df['PRC_1h_lag'] = df['PRC'].shift(1)
-    #df['PRC_24h_lag'] = df['PRC'].shift(24)
-    #df['PRC_168h_lag'] = df['PRC'].shift(168)
+    # PRC lags — discovered during modeling as the single biggest improvement (65% MAE reduction)
+    df['PRC_1h_lag'] = df['PRC'].shift(1)
+    df['PRC_24h_lag'] = df['PRC'].shift(24)
+    df['PRC_168h_lag'] = df['PRC'].shift(168)
+
+    # RT-DAM spread lag — when RT exceeds DAM, the market is under more stress than
+    # day-ahead expected. Lagged 1h so it's observable at prediction time. This is the
+    # key "market surprise" signal for the price model.
+    df['RT_DAM_spread_1h_lag'] = df['RT_DAM_spread'].shift(1)
+
+    # Price spike lag — binary flag: was the previous hour's RT price > $100/MWh?
+    # Spikes cluster in time (congestion events persist across hours), so knowing the
+    # prior hour spiked is a strong predictor of the current hour spiking too.
+    df['price_spike_lag'] = (df['RT_price'].shift(1) > 100).astype(int)
+
+    # PRC rolling stats — capture decline trajectory, not just point-in-time state.
+    # A genuine scarcity onset has PRC declining over several hours; brief dips recover quickly.
+    df['PRC_roll_mean_6h'] = df['PRC'].shift(1).rolling(6).mean()
+    df['PRC_roll_std_6h'] = df['PRC'].shift(1).rolling(6).std()
+    df['PRC_roll_mean_24h'] = df['PRC'].shift(1).rolling(24).mean()
+
     return df
 
 # Rolling stats of lagged prices/load/wind (these cols because they are volatile with repeating patterns)
@@ -106,8 +139,14 @@ def add_engineered_features(df):
     df['renewable_pct_system'] = (df['WGRPP_SYSTEM_WIDE'] + df['PVGRPP_SYSTEM_WIDE']) / df['load_total']
     df['renewable_pct_west'] = df['WGRPP_LZ_WEST'] / df['hub_load']
 
+    # Wind-to-load ratio for West Texas — captures local supply/demand balance.
+    # When wind drops relative to load, the zone relies more on imports through
+    # congested transmission lines, driving local price spikes even when system-wide
+    # reserves (PRC) are comfortable. This is the core congestion signal.
+    df['wind_load_ratio_west'] = df['WGRPP_LZ_WEST'] / df['hub_load']
+
     #Track increasing PRC over time
-    df['days_since_start'] = (df['timestamp'] - df['timestamp'].min()).dt.days
+    df['days_since_start'] = (df['timestamp'] - pd.Timestamp('2021-01-01')).dt.days
 
     #Ramp rates (track hour over hour changes)
     df['load_total_ramp'] = df['load_total'].diff()
@@ -117,6 +156,24 @@ def add_engineered_features(df):
     df['RT_price_ramp'] = df['RT_price'].diff()
 
     return df
+
+def add_ordc_features(df):
+    """
+    Log1p-transform ORDC price adder columns from the merged dataset.
+
+    RTORPA is extremely right-skewed: 84% zeros, typical range 0-10 $/MWh,
+    but Uri 2021 hit ~4,143. Raw values would let that single event dominate
+    linear model coefficients. log1p compresses the spike (4143 -> 8.3) while
+    keeping zero as zero and preserving the relative ordering.
+
+    Post-RTC+B rows (is_pre_rtcb=0) are NaN until gridstatus adder data is
+    pulled — log1p(NaN)=NaN, which propagates intentionally. LGBM handles
+    NaN natively; LR will need imputation at retrain time.
+    """
+    for col in ['RTORPA', 'RTOFFPA', 'RTORDPA']:
+        df[f'{col}_log1p'] = np.log1p(df[col])
+    return df
+
 
 # Add regime labels
 def add_regime_labels(df):
@@ -133,6 +190,7 @@ def feature_engineering_pipeline():
     df = add_lag_features(df)
     df = add_rolling_stats(df)
     df = add_engineered_features(df)
+    df = add_ordc_features(df)
     df = add_regime_labels(df)
 
     # Drop lag warmup rows (first 168 hours)

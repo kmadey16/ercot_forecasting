@@ -5,84 +5,198 @@ import numpy as np
 from pathlib import Path
 import json
 
-import joblib
-import pandas as pd
-import numpy as np
-from pathlib import Path
-import json
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def load_models():
-    lr_1h = joblib.load(PROJECT_ROOT / 'models/lr_1h_prc.pkl')
-    lgbm_1h = joblib.load(PROJECT_ROOT / 'models/lgbm_1h_residual.pkl')
-    lr_24h = joblib.load(PROJECT_ROOT / 'models/lr_24h_prc.pkl')
-    return lr_1h, lgbm_1h, lr_24h
+    """Load all production models (PRC + price + spread)."""
+    lr_1h = joblib.load(PROJECT_ROOT / 'models/lr_1h_prc_v2.pkl')
+    lgbm_1h = joblib.load(PROJECT_ROOT / 'models/lgbm_1h_residual_v2.pkl')
+    lr_24h = joblib.load(PROJECT_ROOT / 'models/lr_24h_prc_v2.pkl')
+    price_1h = joblib.load(PROJECT_ROOT / 'models/lgbm_price_1h_v1.pkl')
+    spread_24h = joblib.load(PROJECT_ROOT / 'models/lgbm_spread_24h_v1.pkl')
+    return lr_1h, lgbm_1h, lr_24h, price_1h, spread_24h
+
 
 def load_thresholds():
     with open(PROJECT_ROOT / 'models/thresholds.json', 'r') as f:
         return json.load(f)
 
-def predict_prc(df, lr_model, lgbm_model=None, drop_cols=None):
-    X = df.drop(columns=drop_cols)
-    
+
+def load_price_metadata():
+    with open(PROJECT_ROOT / 'models/lgbm_price_1h_v1_metadata.json', 'r') as f:
+        return json.load(f)
+
+
+def load_spread_metadata():
+    with open(PROJECT_ROOT / 'models/lgbm_spread_24h_v1_metadata.json', 'r') as f:
+        return json.load(f)
+
+
+def predict_prc(df, lr_model, lgbm_model=None, feature_cols=None, drop_cols=None):
+    """Predict PRC using LR (+ optional LGBM residual).
+
+    Uses feature_cols from model metadata if provided (ensures exact match with
+    training features). Falls back to drop_cols for backwards compatibility.
+    """
+    if feature_cols is not None:
+        X = df[feature_cols]
+    else:
+        X = df.drop(columns=drop_cols, errors='ignore').select_dtypes(include=[np.number])
+
     preds = lr_model.predict(X)
     if lgbm_model is not None:
         preds += lgbm_model.predict(X)
-    
+
     df['predicted_prc'] = preds
-    
+
     bins = [0, 3000, 5000, 10000, float('inf')]
     labels = ['Scarcity', 'Tight', 'Normal', 'Surplus']
     df['predicted_regime'] = pd.cut(preds, bins=bins, labels=labels)
-    
+
     return df
 
-def dispatch_action(predicted_prc, tight_threshold):
+
+def predict_price(df, price_model, feature_cols, price_offset):
+    """Predict RT price using the Layer 2 price model.
+
+    Returns predicted price in raw $/MWh (reverse-transformed from log1p space).
+    """
+    X = df[feature_cols].dropna()
+    pred_log = price_model.predict(X)
+    pred_raw = np.expm1(pred_log) - price_offset
+
+    df.loc[X.index, 'predicted_price'] = pred_raw
+    return df
+
+
+def predict_spread(df, spread_model, feature_cols):
+    """Predict RT-DAM spread using the 24h spread model.
+
+    Returns predicted spread in raw $/MWh and reconstructed RT price (DAM + spread).
+    Advisory signal — informs planning, does not trigger curtailment alone.
+    """
+    X = df[feature_cols]
+    pred_spread = spread_model.predict(X)
+
+    df['predicted_spread'] = pred_spread
+    df['predicted_rt_24h'] = df['DAM_price'] + pred_spread
+    return df
+
+
+def advisory_24h(predicted_prc, predicted_rt_24h, dam_price, tight_threshold):
+    """24h planning advisory — informs scheduling, does NOT trigger curtailment.
+
+    Combines 24h PRC forecast + DAM price + spread prediction into a risk assessment.
+    Operators use this to pre-position (migrate workloads, preserve battery SoC)
+    but actual curtailment decisions happen at the 1h layer.
+    """
+    risks = []
+
+    if predicted_prc < 3000:
+        risks.append('PRC scarcity expected')
+    elif predicted_prc < tight_threshold:
+        risks.append('PRC tight expected')
+
+    if dam_price is not None and dam_price > 100:
+        risks.append(f'DAM high (${dam_price:.0f})')
+
+    if predicted_rt_24h is not None and predicted_rt_24h > 100:
+        risks.append(f'RT may exceed ${predicted_rt_24h:.0f}')
+
+    if risks:
+        return f'ELEVATED RISK — {", ".join(risks)}. Pre-position flexible load.'
+    return 'LOW RISK — standard scheduling'
+
+
+def dispatch_action(predicted_prc, predicted_price, tight_threshold,
+                    price_threshold=None):
+    """Combined Layer 1 + Layer 2 dispatch decision.
+
+    Checks both PRC (system-wide reserves) and predicted price (local congestion).
+    Returns the MORE AGGRESSIVE action of the two signals:
+      - PRC scarcity (<3000 MW) always wins → CURTAIL (emergency)
+      - PRC tight OR price spike → REDUCE
+      - Neither triggered → OPERATE
+
+    The price threshold acts as an independent trigger: even if PRC says "Normal",
+    a predicted price above the threshold means local congestion is likely and
+    you should reduce load to avoid paying elevated rates.
+    """
+    # Layer 1: PRC signal
     if predicted_prc < 3000:
         return 'CURTAIL — emergency, shut down all flexible load'
-    elif predicted_prc < tight_threshold:
-        return 'REDUCE — lower non-critical load'
-    else:
-        return 'OPERATE — standard operations'
+
+    prc_says_reduce = predicted_prc < tight_threshold
+
+    # Layer 2: Price signal (if threshold is set)
+    price_says_reduce = False
+    if price_threshold is not None and predicted_price is not None:
+        price_says_reduce = predicted_price > price_threshold
+
+    if prc_says_reduce or price_says_reduce:
+        if prc_says_reduce and price_says_reduce:
+            return 'REDUCE — PRC tight + price spike, lower non-critical load'
+        elif prc_says_reduce:
+            return 'REDUCE — PRC tight, lower non-critical load'
+        else:
+            return 'REDUCE — price spike, lower non-critical load'
+
+    return 'OPERATE — standard operations'
+
 
 if __name__ == '__main__':
-    lr_1h, lgbm_1h, lr_24h = load_models()
+    lr_1h, lgbm_1h, lr_24h, price_1h, spread_24h = load_models()
     thresholds = load_thresholds()
-    
+    price_meta = load_price_metadata()
+    spread_meta = load_spread_metadata()
+
+    # Load PRC model feature lists from metadata
+    with open(PROJECT_ROOT / 'models/lr_1h_prc_v2_metadata.json') as f:
+        prc_1h_features = json.load(f)['features']
+    with open(PROJECT_ROOT / 'models/lr_24h_prc_v2_metadata.json') as f:
+        prc_24h_features = json.load(f)['features']
+
     df = pd.read_parquet(PROJECT_ROOT / 'data/processed/model_ready.parquet')
-    
-    drop_1h = ['timestamp', 'PRC', 'regime', 'RT_price', 'DAM_price', 'RT_DAM_spread']
-    
-    drop_24h = [
-        'timestamp', 'PRC', 'regime', 'RT_price', 'DAM_price', 'RT_DAM_spread',
-        'hub_load', 'load_total',
-        'WGRPP_LZ_WEST', 'WGRPP_SYSTEM_WIDE', 'PVGRPP_SYSTEM_WIDE',
-        'net_load_system', 'net_load_west',
-        'renewable_pct_system', 'renewable_pct_west',
-        'wind_forecast_error', 'solar_forecast_error',
-        'RT_1h_lag', 'DAM_1h_lag', 'PRC_1h_lag',
-        'RT_price_roll_mean_6h', 'RT_price_roll_std_6h',
-        'DAM_price_roll_mean_6h', 'DAM_price_roll_std_6h',
-        'hub_load_roll_mean_6h', 'hub_load_roll_std_6h',
-        'load_total_roll_mean_6h', 'load_total_roll_std_6h',
-        'WGRPP_LZ_WEST_roll_mean_6h', 'WGRPP_LZ_WEST_roll_std_6h',
-        'load_total_ramp', 'hub_load_ramp',
-        'wind_west_ramp', 'wind_system_ramp',
-        'RT_price_ramp'
-    ]
-    
-    # 1h predictions (ensemble)
+
+    # Impute ORDC NaNs for LR models
+    df_lr = df.copy()
+    for col in ['RTORPA_log1p', 'RTOFFPA_log1p', 'RTORDPA_log1p']:
+        if col in df_lr.columns:
+            df_lr[col] = df_lr[col].fillna(0)
+
+    # ── 1h Layer (decision-producing) ────────────────────────────
+    results = predict_prc(df_lr.copy(), lr_1h, lgbm_1h, feature_cols=prc_1h_features)
+    results = predict_price(results, price_1h, price_meta['features'],
+                            price_meta['price_offset'])
+
     t_1h = thresholds['mining_1h']['tight_threshold']
-    results_1h = predict_prc(df.copy(), lr_1h, lgbm_1h, drop_1h)
-    results_1h['action'] = results_1h['predicted_prc'].apply(lambda x: dispatch_action(x, t_1h))
-    print('--- 1h Model ---')
-    print(results_1h[['timestamp', 'predicted_prc', 'predicted_regime', 'action']].tail(24))
-    
-    # 24h predictions (LR only)
+    price_thresh = thresholds.get('price_1h', {}).get('mining_threshold')
+
+    results['action'] = results.apply(
+        lambda row: dispatch_action(
+            row['predicted_prc'], row.get('predicted_price'),
+            t_1h, price_thresh
+        ), axis=1
+    )
+
+    print('--- 1h Layer (Decision) ---')
+    print(results[['timestamp', 'predicted_prc', 'predicted_regime',
+                   'predicted_price', 'action']].tail(24))
+
+    # ── 24h Layer (advisory/planning) ────────────────────────────
+    results_24h = predict_prc(df_lr.copy(), lr_24h, feature_cols=prc_24h_features)
+    results_24h = predict_spread(results_24h, spread_24h, spread_meta['features'])
+
     t_24h = thresholds['mining_24h']['tight_threshold']
-    results_24h = predict_prc(df.copy(), lr_24h, lgbm_model=None, drop_cols=drop_24h)
-    results_24h['action'] = results_24h['predicted_prc'].apply(lambda x: dispatch_action(x, t_24h))
-    print('\n--- 24h Model ---')
-    print(results_24h[['timestamp', 'predicted_prc', 'predicted_regime', 'action']].tail(24))
+    results_24h['advisory'] = results_24h.apply(
+        lambda row: advisory_24h(
+            row['predicted_prc'], row.get('predicted_rt_24h'),
+            row.get('DAM_price'), t_24h
+        ), axis=1
+    )
+
+    print('\n--- 24h Layer (Advisory) ---')
+    print(results_24h[['timestamp', 'predicted_prc', 'predicted_regime',
+                       'DAM_price', 'predicted_spread', 'predicted_rt_24h',
+                       'advisory']].tail(24))

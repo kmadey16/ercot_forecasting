@@ -15,8 +15,10 @@ def pull_prc(start, end):
     """Post-RTC+B PRC only (Dec 5, 2025+)""" # FROM GRIDSTATUSIO System-wide
     
     from gridstatusio import GridStatusClient
+    from dotenv import load_dotenv
     import os
-    
+
+    load_dotenv()
     client = GridStatusClient(api_key=os.environ.get("GRIDSTATUS_API_KEY"))
 
     df = client.get_dataset(
@@ -29,18 +31,26 @@ def pull_prc(start, end):
     df.to_parquet(RAW_DIR / f"prc_{start}_{end}.parquet", index=False)
     print(f"PRC: {len(df)} rows")
 
-def pull_price_adders(start,end): #post RTC+B price adders using GridstatusIO
+def pull_price_adders(start, end):
+    """Post-RTC+B price adders via GridStatus.io API.
+    Open-source gridstatus can't do this efficiently — ERCOT MIS publishes each
+    5-min SCED interval as a separate document (~288/day), and the library's
+    get_real_time_adders_and_reserves has a post-RTC+B column bug (BatchID missing).
+    Pull weekly to stay within API row limits.
+    """
     from gridstatusio import GridStatusClient
+    from dotenv import load_dotenv
     import os
 
+    load_dotenv()
     client = GridStatusClient(api_key=os.environ.get("GRIDSTATUS_API_KEY"))
 
     df = client.get_dataset(
-    dataset="ercot_real_time_adders",
-    start=start,
-    end=end,
-    timezone="market",
-    limit=100000)
+        dataset="ercot_real_time_adders",
+        start=start,
+        end=end,
+        timezone="market",
+        limit=100000)
 
     df.to_parquet(RAW_DIR / f"price_adders_{start}_{end}.parquet", index=False)
     print(f"price_adders: {len(df)} rows")
@@ -160,7 +170,7 @@ def pull_new_data(start, end):
     pull_as_prices(ercot, start, end)
     pull_rt_prices(ercot, start, end)
     pull_dam_prices(ercot, start, end)
-    pull_prc(start, end)  # gridstatusio
-    #pull_price_adders(start,end) #gridstatusio (dont run yet)
+    pull_prc(start, end)  # gridstatusio (PRC not available via open-source post-RTC+B)
+    pull_price_adders(start, end)  # gridstatusio (open-source too slow: 288 HTTP reqs/day)
 
     print("Done")

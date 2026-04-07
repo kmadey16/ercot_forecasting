@@ -1,1 +1,24 @@
-{"mining_1h": {"tight_threshold": 6750, "scarcity_threshold": 2000}, "mining_24h": {"tight_threshold": 6750, "scarcity_threshold": 2000}, "datacenter_1h": {"tight_threshold": 6750, "scarcity_threshold": 2000}, "datacenter_24h": {"tight_threshold": 6500, "scarcity_threshold": 2000}}
+{
+  "mining_1h": {
+    "tight_threshold": 6750,
+    "scarcity_threshold": 2000
+  },
+  "mining_24h": {
+    "tight_threshold": 6750,
+    "scarcity_threshold": 2000
+  },
+  "datacenter_1h": {
+    "tight_threshold": 6750,
+    "scarcity_threshold": 2000
+  },
+  "datacenter_24h": {
+    "tight_threshold": 6500,
+    "scarcity_threshold": 2000
+  },
+  "price_1h": {
+    "mining_threshold": 40.0,
+    "mining_net_savings_val": 7728388.0,
+    "datacenter_threshold": 50.0,
+    "datacenter_net_savings_val": 1140849.0
+  }
+}

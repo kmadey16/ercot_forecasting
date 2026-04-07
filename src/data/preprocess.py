@@ -75,7 +75,24 @@ def clean_RT_data(filepaths, hub='HB_WEST'):
     df_rt_hourly.columns = ['timestamp', 'RT_price']
 
     df_rt_hourly = df_rt_hourly.sort_values('timestamp').reset_index(drop=True)
-    
+
+    # Append GridStatus.io API parquets (post-RTC+B going-forward pulls, already hourly)
+    gs_dir = BASE_DIR / 'data' / 'raw' / 'gridstatus'
+    for f in sorted(gs_dir.glob('rt_prices_*.parquet')):
+        gs = pd.read_parquet(f)
+        if 'interval_start_utc' in gs.columns:
+            gs['timestamp'] = (
+                pd.to_datetime(gs['interval_start_utc'], utc=True)
+                .dt.tz_convert('America/Chicago')
+                .dt.tz_localize(None)
+            )
+            gs = gs.rename(columns={'spp': 'RT_price'})[['timestamp', 'RT_price']]
+            df_rt_hourly = pd.concat([df_rt_hourly, gs], ignore_index=True)
+            print(f"  + GridStatus RT: {len(gs)} rows from {f.name}")
+
+    df_rt_hourly = df_rt_hourly.drop_duplicates(subset='timestamp', keep='first')
+    df_rt_hourly = df_rt_hourly.sort_values('timestamp').reset_index(drop=True)
+
     return df_rt_hourly
 
 def clean_DAM_data(filepaths, hub='HB_WEST'):
@@ -125,18 +142,131 @@ def clean_DAM_data(filepaths, hub='HB_WEST'):
     # Clean up - just keep timestamp and price
     df_da_clean = df_da[['timestamp', 'SettlementPointPrice']].copy()
     df_da_clean.columns = ['timestamp', 'DAM_price']
+
+    # Merge gap-fill data pulled from gridstatus (covers days missing from scraped CSVs)
+    # Gap fill uses hour-beginning (Interval Start), but CSV data uses hour-ending
+    # (from fix_hour24_helper). Add 1h so the merge step's -1h adjustment treats both
+    # sources consistently.
+    gap_fill_path = base / 'dam_gap_fill.parquet'
+    if gap_fill_path.exists():
+        gf = pd.read_parquet(gap_fill_path)
+        gf = gf.rename(columns={'Interval Start': 'timestamp', 'SPP': 'DAM_price'})
+        gf = gf[['timestamp', 'DAM_price']].copy()
+        gf['timestamp'] = pd.to_datetime(gf['timestamp']) + pd.Timedelta(hours=1)
+        df_da_clean = pd.concat([df_da_clean, gf], ignore_index=True)
+
+    df_da_clean = df_da_clean.drop_duplicates(subset='timestamp', keep='first')
+
+    # Append GridStatus.io API parquets (post-RTC+B going-forward pulls, already hourly)
+    # GridStatus uses hour-beginning (interval_start_utc). CSV data uses hour-ending.
+    # Add +1h so the merge step's -1h adjustment produces correct hour-beginning alignment
+    # (same convention as dam_gap_fill).
+    gs_dir = BASE_DIR / 'data' / 'raw' / 'gridstatus'
+    for f in sorted(gs_dir.glob('dam_prices_*.parquet')):
+        gs = pd.read_parquet(f)
+        if 'interval_start_utc' in gs.columns:
+            gs['timestamp'] = (
+                pd.to_datetime(gs['interval_start_utc'], utc=True)
+                .dt.tz_convert('America/Chicago')
+                .dt.tz_localize(None)
+                + pd.Timedelta(hours=1)
+            )
+            gs = gs.rename(columns={'spp': 'DAM_price'})[['timestamp', 'DAM_price']]
+            df_da_clean = pd.concat([df_da_clean, gs], ignore_index=True)
+            print(f"  + GridStatus DAM: {len(gs)} rows from {f.name}")
+
     df_da_clean = df_da_clean.drop_duplicates(subset='timestamp', keep='first')
 
     return df_da_clean
 
-def clean_prc(pre_rtcb_dir, post_rtcb_filepath):
+def clean_ordc_adders(pre_rtcb_dir, post_rtcb_dir):
+    """
+    Build unified ORDC/RDPA price adder series from pre and post RTC+B sources.
+
+    Pre-RTC+B (2021 – Dec 4, 2025): ERCOT archive xlsx, 5-min SCED intervals.
+        RTORPA  – ORDC Reserve Price Adder ($/MWh), fired when PRC is low
+        RTOFFPA – Off-line reserve adder ($/MWh)
+        RTORDPA – ORDC Deployment Price Adder ($/MWh)
+
+    Post-RTC+B (Dec 5, 2025+): GridStatus.io API parquet files.
+        rtrdpa  – Reliability Deployment Price Adder, functional analog to RTORPA
+        RTOFFPA / RTORDPA have no clean post-RTC+B equivalent → NaN
+
+    Both sources aggregated from 5-min to hourly mean.
+    Output columns: ['timestamp', 'RTORPA', 'RTOFFPA', 'RTORDPA']
+    """
+    ADDER_COLS = ['SCED Timestamp', 'RTORPA', 'RTOFFPA', 'RTORDPA']
+
+    # 1. Pre-RTC+B: read xlsx archive files
+    all_years = []
+    for filepath in sorted(Path(pre_rtcb_dir).glob("price_adders_*.xlsx")):
+        sheet_dict = pd.read_excel(filepath, sheet_name=None)
+        all_sheets = []
+        for name, sheet in sheet_dict.items():
+            if name.lower() in ['report info', 'sheet1']:
+                continue
+            sheet.columns = sheet.iloc[7].values
+            sheet = sheet.iloc[8:].reset_index(drop=True)
+            sheet.columns = sheet.columns.str.strip()
+            sheet = sheet[ADDER_COLS].copy()
+            sheet['SCED Timestamp'] = pd.to_datetime(sheet['SCED Timestamp'])
+            sheet['hour'] = sheet['SCED Timestamp'].dt.floor('h')
+            sheet = sheet.groupby('hour').agg({'RTORPA': 'mean', 'RTOFFPA': 'mean', 'RTORDPA': 'mean'}).reset_index()
+            all_sheets.append(sheet)
+        all_years.append(pd.concat(all_sheets).reset_index(drop=True))
+
+    pre = pd.concat(all_years).reset_index(drop=True)
+    for col in ['RTORPA', 'RTOFFPA', 'RTORDPA']:
+        pre[col] = pd.to_numeric(pre[col], errors='coerce')
+    pre = pre.rename(columns={'hour': 'timestamp'})
+
+    # 2. Post-RTC+B: GridStatus.io parquet files
+    post_files = sorted(Path(post_rtcb_dir).glob("price_adders_*.parquet"))
+    if post_files:
+        post_dfs = []
+        for f in post_files:
+            df = pd.read_parquet(f)
+            # Normalize column names — GridStatus.io may return ERCOT-native casing
+            # (SCEDTimestamp, RTRDPA) or lowercase (sced_timestamp_utc, rtrdpa)
+            col_map = {c: c.lower() for c in df.columns}
+            df = df.rename(columns=col_map)
+            # Determine timestamp column and parse
+            if 'sced_timestamp_utc' in df.columns:
+                df['timestamp'] = (
+                    pd.to_datetime(df['sced_timestamp_utc'], utc=True)
+                    .dt.tz_convert('America/Chicago')
+                    .dt.tz_localize(None)
+                    .dt.floor('h')
+                )
+            elif 'scedtimestamp' in df.columns:
+                # Market-local naive datetime string
+                df['timestamp'] = pd.to_datetime(df['scedtimestamp']).dt.floor('h')
+            else:
+                raise KeyError(f"No recognized timestamp column in {f.name}: {list(df.columns)}")
+            # rtrdpa is the post-RTC+B analog to RTORPA; RTOFFPA/RTORDPA have no equivalent
+            df['rtrdpa'] = pd.to_numeric(df['rtrdpa'], errors='coerce')
+            df = df.groupby('timestamp').agg(RTORPA=('rtrdpa', 'mean')).reset_index()
+            df['RTOFFPA'] = np.nan
+            df['RTORDPA'] = np.nan
+            post_dfs.append(df)
+        post = pd.concat(post_dfs).reset_index(drop=True)
+    else:
+        post = pd.DataFrame(columns=['timestamp', 'RTORPA', 'RTOFFPA', 'RTORDPA'])
+
+    # 3. Concat pre + post, sort, deduplicate
+    adders = pd.concat([pre, post]).sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
+    return adders[['timestamp', 'RTORPA', 'RTOFFPA', 'RTORDPA']]
+
+
+def clean_prc(pre_rtcb_dir, post_rtcb_dir):
     """
     Build unified PRC series from pre and post RTC+B sources.
     Pre: ERCOT archive xlsx files (2021 - Dec 4, 2025)
-    Post: GridStatus.io CSV/parquet (Dec 5, 2025+)
+    Post: legacy post_prc.csv in ercot_archive/ (manually downloaded) plus
+          any prc_*.parquet files saved by pull_prc() in data/raw/gridstatus/
     """
     # 1. Read and process all pre-RTC+B xlsx files
-    
+
     all_years = []
     for filepath in sorted(Path(pre_rtcb_dir).glob("price_adders_*.xlsx")):
         sheet_dict = pd.read_excel(filepath, sheet_name=None)
@@ -148,10 +278,10 @@ def clean_prc(pre_rtcb_dir, post_rtcb_filepath):
             sheet.columns = sheet.iloc[7].values
             sheet = sheet.iloc[8:].reset_index(drop=True)
             sheet.columns = sheet.columns.str.strip(" ")
-    
+
             cols = ['SCED Timestamp', 'PRC']
             sheet = sheet[cols].copy()
-            
+
             sheet['SCED Timestamp'] = pd.to_datetime(sheet['SCED Timestamp'])
             sheet['hour'] = sheet['SCED Timestamp'].dt.floor('h')
 
@@ -162,7 +292,7 @@ def clean_prc(pre_rtcb_dir, post_rtcb_filepath):
         full_table = pd.concat(all_sheets)
         full_table.reset_index(inplace=True, drop=True)
         all_years.append(full_table)
-    
+
     pre = pd.concat(all_years).reset_index(drop=True)
     pre['PRC'] = pd.to_numeric(pre['PRC'])
     pre.loc[pre['PRC'] < 0, 'PRC'] = np.nan
@@ -170,14 +300,47 @@ def clean_prc(pre_rtcb_dir, post_rtcb_filepath):
     pre = pre[['hour', 'PRC']]
     pre = pre.rename(columns={'hour': 'timestamp'})
 
-    # 2. Read post-RTC+B
-    post = pd.read_csv(post_rtcb_filepath)
-    post['timestamp'] = pd.to_datetime(post['interval_start_local']).dt.tz_localize(None)
-    post = post[['timestamp', 'prc']].rename(columns={'prc':'PRC'})
+    # 2. Read post-RTC+B — legacy CSV first, then any API-pulled parquets on top
+    post_dfs = []
+    legacy_csv = Path(pre_rtcb_dir) / 'post_prc.csv'
+    if legacy_csv.exists():
+        df = pd.read_csv(legacy_csv)
+        df['timestamp'] = pd.to_datetime(df['interval_start_local']).dt.tz_localize(None)
+        post_dfs.append(df[['timestamp', 'prc']].rename(columns={'prc': 'PRC'}))
 
-    # 3. Concat
-    prc = pd.concat([pre, post]).sort_values('timestamp').reset_index(drop=True)
-    
+    for f in sorted(Path(post_rtcb_dir).glob("prc_*.parquet")):
+        df = pd.read_parquet(f)
+        # Handle three schema versions from GridStatus.io:
+        # 1. 'interval_start_local' — single pull with timezone='market'
+        # 2. 'time_local' — batch pull via gridstatusio client
+        # 3. 'interval_start_utc' — hourly resampled pull (preferred)
+        if 'interval_start_utc' in df.columns:
+            df['timestamp'] = (
+                pd.to_datetime(df['interval_start_utc'], utc=True)
+                .dt.tz_convert('America/Chicago')
+                .dt.tz_localize(None)
+            )
+        elif 'interval_start_local' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['interval_start_local']).dt.tz_localize(None)
+        elif 'time_local' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['time_local']).dt.tz_localize(None)
+        else:
+            raise KeyError(f"No recognized timestamp column in {f.name}: {list(df.columns)}")
+        post_dfs.append(df[['timestamp', 'prc']].rename(columns={'prc': 'PRC'}))
+
+    # 3. Aggregate post-RTC+B to hourly min (same as pre-RTC+B)
+    # PRC data comes in at 5-min SCED intervals. Hourly min = most stressed moment
+    # in the hour (conservative for curtailment decisions).
+    if post_dfs:
+        post = pd.concat(post_dfs).sort_values('timestamp').reset_index(drop=True)
+        post['PRC'] = pd.to_numeric(post['PRC'], errors='coerce')
+        post['hour'] = post['timestamp'].dt.floor('h')
+        post = post.groupby('hour').agg({'PRC': 'min'}).reset_index()
+        post = post.rename(columns={'hour': 'timestamp'})
+        prc = pd.concat([pre, post]).sort_values('timestamp').drop_duplicates(subset='timestamp').reset_index(drop=True)
+    else:
+        prc = pre.sort_values('timestamp').reset_index(drop=True)
+
     return prc
 
 def clean_load_data(filepaths, hub = 'WEST'):
@@ -198,6 +361,25 @@ def clean_load_data(filepaths, hub = 'WEST'):
     #Filter cols
     df_load_clean = load_df[['timestamp', hub, 'TOTAL']]
     df_load_clean.columns = ['timestamp', 'hub_load', 'load_total']
+    df_load_clean = df_load_clean.drop_duplicates(subset='timestamp', keep='first')
+
+    # Append GridStatus.io API parquets (zone-level load, already hourly)
+    # Uses hour-beginning; add +1h for hour-ending convention (merge step subtracts 1h).
+    gs_dir = BASE_DIR / 'data' / 'raw' / 'gridstatus'
+    for f in sorted(gs_dir.glob('load_zone_*.parquet')):
+        gs = pd.read_parquet(f)
+        if 'interval_start_utc' in gs.columns and 'west' in gs.columns:
+            gs['timestamp'] = (
+                pd.to_datetime(gs['interval_start_utc'], utc=True)
+                .dt.tz_convert('America/Chicago')
+                .dt.tz_localize(None)
+                + pd.Timedelta(hours=1)
+            )
+            gs = gs.rename(columns={'west': 'hub_load', 'system_total': 'load_total'})
+            gs = gs[['timestamp', 'hub_load', 'load_total']]
+            df_load_clean = pd.concat([df_load_clean, gs], ignore_index=True)
+            print(f"  + GridStatus load: {len(gs)} rows from {f.name}")
+
     df_load_clean = df_load_clean.drop_duplicates(subset='timestamp', keep='first')
 
     return df_load_clean
@@ -293,63 +475,92 @@ def clean_outages_data(filepaths):
 
     return outages_df
 
-def fetch_weather_data(start_date='2021-01-01', end_date='2025-12-31', 
+def fetch_weather_data(start_date='2021-01-01', end_date=None,
                        lat=31.99, lon=-102.08, location_name='Midland, TX'):
     """
-    Fetch weather data from Open-Meteo API
-    - Uses Midland, Texas coordinates (center of West Texas HUB)
-    - Hourly weather data
-    
+    Fetch weather data from Open-Meteo using two sources:
+    1. Archive API (ERA5 reanalysis) — historical bulk, ~5 day lag
+    2. Forecast API — recent days through present, bridges the ERA5 gap
+
+    Archive data is preferred where both overlap (reanalysis is more accurate).
+    Uses Midland, Texas coordinates (center of West Texas HUB).
+
     Parameters:
     -----------
     start_date : str
         Start date (YYYY-MM-DD)
     end_date : str
-        End date (YYYY-MM-DD)
+        End date for archive pull (YYYY-MM-DD). Defaults to 5 days ago.
     lat : float
         Latitude (default: 31.99 for Midland, TX)
     lon : float
         Longitude (default: -102.08 for Midland, TX)
     location_name : str
         Location name for display
-    
+
     Returns:
     --------
     pd.DataFrame
         Weather data with columns: ['timestamp', 'temperature', 'humidity', 'windspeed', 'precipitation']
     """
-    
-    # Open-Meteo API endpoint for historical data
-    url = "https://archive-api.open-meteo.com/v1/archive"
-    
-    params = {
+
+    # 1. Archive API — historical bulk up to ~5 days ago
+    if end_date is None:
+        end_date = (pd.Timestamp.now() - pd.Timedelta(days=5)).strftime('%Y-%m-%d')
+
+    archive_url = "https://archive-api.open-meteo.com/v1/archive"
+    archive_params = {
         "latitude": lat,
         "longitude": lon,
         "start_date": start_date,
         "end_date": end_date,
         "hourly": ["temperature_2m", "relativehumidity_2m", "windspeed_10m", "precipitation"],
-        "timezone": "America/Chicago"  # CST/CDT for Texas
+        "timezone": "America/Chicago"
     }
-    
-    # Make the API request
-    response = requests.get(url, params=params)
-    
+
+    response = requests.get(archive_url, params=archive_params)
     if response.status_code != 200:
-        print(f" API request failed with status code {response.status_code}")
+        print(f"  Archive API failed with status code {response.status_code}")
         return None
-    
-    weather_data = response.json()
-    
-    # Convert to DataFrame
-    weather_df = pd.DataFrame({
-        'timestamp': pd.to_datetime(weather_data['hourly']['time']),
-        'temperature': weather_data['hourly']['temperature_2m'],
-        'humidity': weather_data['hourly']['relativehumidity_2m'],
-        'windspeed': weather_data['hourly']['windspeed_10m'],
-        'precipitation': weather_data['hourly']['precipitation']
+
+    archive_data = response.json()
+    archive_df = pd.DataFrame({
+        'timestamp': pd.to_datetime(archive_data['hourly']['time']),
+        'temperature': archive_data['hourly']['temperature_2m'],
+        'humidity': archive_data['hourly']['relativehumidity_2m'],
+        'windspeed': archive_data['hourly']['windspeed_10m'],
+        'precipitation': archive_data['hourly']['precipitation']
     })
-    
-    # Sort by timestamp
+
+    # 2. Forecast API — recent days through present to bridge ERA5 lag
+    forecast_url = "https://api.open-meteo.com/v1/forecast"
+    forecast_params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": ["temperature_2m", "relative_humidity_2m", "wind_speed_10m", "precipitation"],
+        "timezone": "America/Chicago",
+        "past_days": 10,
+        "forecast_days": 2
+    }
+
+    forecast_response = requests.get(forecast_url, params=forecast_params)
+    if forecast_response.status_code == 200:
+        forecast_data = forecast_response.json()
+        forecast_df = pd.DataFrame({
+            'timestamp': pd.to_datetime(forecast_data['hourly']['time']),
+            'temperature': forecast_data['hourly']['temperature_2m'],
+            'humidity': forecast_data['hourly']['relative_humidity_2m'],
+            'windspeed': forecast_data['hourly']['wind_speed_10m'],
+            'precipitation': forecast_data['hourly']['precipitation']
+        })
+        # Concat, preferring archive (reanalysis) where both overlap
+        weather_df = pd.concat([archive_df, forecast_df]).drop_duplicates(
+            subset='timestamp', keep='first'
+        )
+    else:
+        print(f"  Forecast API failed ({forecast_response.status_code}), using archive only")
+        weather_df = archive_df
+
     weather_df = weather_df.sort_values('timestamp').reset_index(drop=True)
 
     return weather_df
@@ -373,9 +584,13 @@ def preprocess_pipeline():
     dam_lmp.to_parquet(interim / 'DAM_cleaned.parquet')     
     del dam_lmp
 
-    prc = clean_prc(pre_rtcb_dir= base / 'ercot_archive/', post_rtcb_filepath= base / 'ercot_archive/post_prc.csv')
+    prc = clean_prc(pre_rtcb_dir= base / 'ercot_archive/', post_rtcb_dir= BASE_DIR / 'data' / 'raw' / 'gridstatus')
     prc.to_parquet(interim / 'prc_cleaned.parquet')
     del prc
+
+    ordc = clean_ordc_adders(pre_rtcb_dir= base / 'ercot_archive/', post_rtcb_dir= BASE_DIR / 'data' / 'raw' / 'gridstatus')
+    ordc.to_parquet(interim / 'ordc_adders_cleaned.parquet')
+    del ordc
 
     load = clean_load_data(glob.glob(str(base / '*load_data*.csv')))
     load.to_parquet(interim / 'load_cleaned.parquet') 
@@ -401,12 +616,51 @@ def preprocess_pipeline():
     fcst.to_parquet(interim / 'fcst_cleaned.parquet')
     del fcst
     
-    # STEP 5: Merge everything
-    date_range = pd.date_range(start='2021-01-01 00:00:00', end='2025-12-31 23:00:00', freq='h')
-    merged = pd.DataFrame({'timestamp': date_range})
-    hour_ending_files = ['rt_cleaned', 'DAM_cleaned', 'load_cleaned', 'outages_cleaned', 'solar_cleaned', 'wind_cleaned', 'fcst_cleaned']
+    # DAM system-wide price (HB_HUBAVG) for congestion spread calculation.
+    # Pulled from gridstatus get_dam_spp() — same archive as HB_WEST DAM.
+    # Timestamps are hour-beginning; add +1h so the merge step's -1h adjustment
+    # produces correct hour-beginning alignment (same convention as dam_gap_fill).
+    dam_sys_path = BASE_DIR / 'data' / 'raw' / 'gridstatus' / 'dam_hubavg_2021_2025.parquet'
+    if dam_sys_path.exists():
+        dam_sys = pd.read_parquet(dam_sys_path)
+        dam_sys['timestamp'] = pd.to_datetime(dam_sys['timestamp']) + pd.Timedelta(hours=1)
+        dam_sys.to_parquet(interim / 'dam_system_cleaned.parquet')
+        del dam_sys
+        print("  DAM system lambda cleaned ✓")
+    else:
+        print("  ⚠ DAM system file not found — run pull_dam_hubavg() first")
 
-    for f in ['rt_cleaned', 'DAM_cleaned', 'load_cleaned', 'weather_cleaned', 'outages_cleaned', 'solar_cleaned', 'wind_cleaned', 'fcst_cleaned', 'prc_cleaned']:
+    # Waha Hub natural gas spot price (daily, from EIA API).
+    # Gas price sets the marginal cost of electricity when wind drops — a key driver of
+    # price spikes, especially for the 24h model where real-time signals aren't available.
+    # Daily price forward-filled to hourly (doesn't change intra-day).
+    gas_path = BASE_DIR / 'data' / 'raw' / 'gridstatus' / 'gas_price_waha_2021_2025.parquet'
+    if gas_path.exists():
+        gas = pd.read_parquet(gas_path)
+        gas['timestamp'] = pd.to_datetime(gas['date'])
+        gas = gas[['timestamp', 'gas_price_waha']].sort_values('timestamp')
+        gas.to_parquet(interim / 'gas_price_cleaned.parquet')
+        del gas
+        print("  Gas price (Waha Hub) cleaned ✓")
+    else:
+        print("  ⚠ Gas price file not found — run EIA pull first")
+
+    # STEP 5: Merge everything
+    # End date derived from the latest timestamp in the cleaned data so new pulls are included automatically
+    _end = max(
+        pd.read_parquet(interim / f).index.max() if pd.read_parquet(interim / f).index.name == 'timestamp'
+        else pd.read_parquet(interim / f)['timestamp'].max()
+        for f in ['rt_cleaned.parquet', 'prc_cleaned.parquet', 'load_cleaned.parquet']
+    )
+    date_range = pd.date_range(start='2021-01-01 00:00:00', end=_end, freq='h')
+    merged = pd.DataFrame({'timestamp': date_range})
+    hour_ending_files = ['DAM_cleaned', 'load_cleaned', 'outages_cleaned', 'solar_cleaned', 'wind_cleaned', 'fcst_cleaned']
+
+    merge_files = ['rt_cleaned', 'DAM_cleaned', 'load_cleaned', 'weather_cleaned', 'outages_cleaned', 'solar_cleaned', 'wind_cleaned', 'fcst_cleaned', 'prc_cleaned', 'ordc_adders_cleaned']
+    if (interim / 'dam_system_cleaned.parquet').exists():
+        merge_files.append('dam_system_cleaned')
+        hour_ending_files.append('dam_system_cleaned')
+    for f in merge_files:
         df = pd.read_parquet(interim / (f + '.parquet'))
         if f in hour_ending_files:
             df['timestamp'] = df['timestamp'] - pd.Timedelta(hours=1)
@@ -414,6 +668,19 @@ def preprocess_pipeline():
         del df
 
     merged['RT_DAM_spread'] = merged['RT_price'] - merged['DAM_price']
+
+    # Gas price: daily → hourly via merge_asof (each hour gets the most recent daily price)
+    if (interim / 'gas_price_cleaned.parquet').exists():
+        gas = pd.read_parquet(interim / 'gas_price_cleaned.parquet')
+        gas['timestamp'] = pd.to_datetime(gas['timestamp'])
+        merged = pd.merge_asof(
+            merged.sort_values('timestamp'),
+            gas.sort_values('timestamp'),
+            on='timestamp',
+            direction='backward'  # each hour gets the most recent daily price
+        )
+        print(f"  Gas price merged: {merged['gas_price_waha'].notna().sum()} / {len(merged)} non-null")
+
     merged.to_parquet(interim / 'merged_all_data.parquet')
     
     return merged
