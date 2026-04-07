@@ -8,10 +8,10 @@ ERCOT's Physical Responsive Capability (PRC) measures system-wide reserve levels
 
 Most approaches predict either grid reserves or electricity price. Neither alone works:
 
-- **PRC-only** catches system-wide emergencies (Uri, statewide heat) but misses congestion. During our 18-month test window, PRC-only saved **$22K**. The price model saved **$17.2M**.
+- **PRC-only** catches system-wide emergencies (Uri, statewide heat) but misses congestion. During our 18-month test window, PRC-only saved **$22K**. The price model saved **$17.2M**. During this window there were zero system-wide scarcity events — congestion-driven spikes were the entire story. PRC is the safety net for Uri-type events; price is the daily P&L driver.
 - **Price-only** catches congestion but can't see system-wide emergencies 24h ahead.
 
-This system runs both in parallel. Either signal triggers curtailment. Combined: **99.7% of perfect-foresight savings** for a 200 MW mining operation.
+This system runs both in parallel. Either signal triggers curtailment. In backtest: **99.7% of perfect-foresight savings within this test window** for a 200 MW mining operation.
 
 ## How It Makes Money
 
@@ -22,7 +22,7 @@ This system runs both in parallel. Either signal triggers curtailment. Combined:
 | Mining 200 MW | $22K saved | **$17.2M saved** | $17.2M |
 | Datacenter 200 MW | $3K saved | **$2.2M saved** | $2.1M |
 
-The datacenter strategy at $60 threshold actually **beats the oracle** (103.7%) because partial load shedding at moderate spikes is more efficient than the oracle's all-or-nothing approach.
+Assumes signal received at hour start, curtailment executable within 15 minutes, no ramp constraints modeled. The datacenter strategy at $60 beats the oracle because partial load shedding at moderate spikes is more efficient than all-or-nothing curtailment.
 
 ### Winter Storm Uri — Unseen Event Detection
 
@@ -38,19 +38,18 @@ The models detected an event type they had never seen. Regression + thresholds e
 
 ```
 1h LAYER — DECISION (triggers curtailment)
-  ├─ PRC regression (LR + LGBM):  pred < 3,000 MW → CURTAIL
-  │                                 pred < 5,000 MW → REDUCE
-  └─ Price regression (LGBM):      pred > $40/MWh  → REDUCE (mining)
-                                    pred > $50/MWh  → REDUCE (datacenter)
+  ├─ PRC model:   pred < 3,000 MW → CURTAIL  |  pred < 5,000 MW → REDUCE
+  └─ Price model: pred > $40/MWh  → REDUCE (mining)
+                  pred > $50/MWh  → REDUCE (datacenter)
       ↳ Either signal fires → take the more aggressive action
 
 24h LAYER — ADVISORY (informs scheduling, no auto-curtailment)
-  ├─ PRC regression (LR):          next-day reserve risk
-  ├─ RT-DAM spread model (LGBM):   price deviation early warning
-  └─ DAM price (free signal):      strongest 24h input, no model needed
+  ├─ PRC model:         next-day reserve risk
+  ├─ RT-DAM spread:     price deviation early warning
+  └─ DAM price (free):  strongest 24h input, no model needed
 ```
 
-The 1h layer drives decisions. The 24h layer informs planning — datacenters pre-migrate workloads, batteries pre-position charge.
+The 1h layer drives curtailment decisions. The 24h layer informs planning — datacenters pre-migrate workloads, batteries pre-position charge.
 
 ## Model Performance
 
