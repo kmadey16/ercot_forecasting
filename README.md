@@ -15,14 +15,32 @@ This system runs both in parallel. Either signal triggers curtailment. In backte
 
 ## How It Makes Money
 
-### Economic Backtest (Jul 2024 – Dec 2025, 12,144 hours)
+### Economic Backtest (Jul 2024 – Apr 2026, 14,801 hours)
 
-| Use Case | PRC-Only | Combined System | Oracle (Perfect) |
-|----------|----------|-----------------|------------------|
-| Mining 200 MW | $22K saved | **$17.2M saved** | $17.2M |
-| Datacenter 200 MW | $3K saved | **$2.2M saved** | $2.1M |
+**Mining (200 MW, $40/MWh revenue baseline):**
 
-Assumes signal received at hour start, curtailment executable within 15 minutes, no ramp constraints modeled. The datacenter strategy at $60 beats the oracle because partial load shedding at moderate spikes is more efficient than all-or-nothing curtailment.
+| Strategy | What it is | Savings | % Oracle |
+|----------|-----------|---------|----------|
+| DAM-only @$40 | Read DAM prices, curtail when high | $20.0M | 83.8% |
+| RT lag-react @$40 | Watch last hour's price, react | $21.3M | 89.0% |
+| **Combined system @$40** | **Our 1h PRC + price models** | **$23.8M** | **99.7%** |
+| Oracle | Perfect foresight | $23.9M | 100% |
+
+**Datacenter (200 MW, 65% critical / 35% flexible, $50 penalty):**
+
+| Strategy | Savings | % Oracle |
+|----------|---------|----------|
+| DAM-only @$60 | $2.5M | 67.3% |
+| RT lag-react @$60 | $2.7M | 73.7% |
+| **Combined system @$60** | **$3.2M** | **85.9%** |
+| Oracle @>$143 | $3.7M | 100% |
+
+**Incremental value vs what operators already do:**
+- vs DAM-only: **+$3.8M** more over 18 months (19% improvement)
+- vs reacting to last hour's RT price: **+$2.5M** more (12% improvement)
+- Combined system has **169 false positive hours** ($53K lost) vs **1,008 false positives** for DAM-only ($1.7M lost) — 6x fewer bad calls
+
+Assumes signal received at hour start, curtailment executable within 15 minutes, no ramp constraints modeled.
 
 ### Winter Storm Uri — Unseen Event Detection
 

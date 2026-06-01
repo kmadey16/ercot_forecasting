@@ -425,10 +425,13 @@ def clean_solar(filepaths):
     return solar_df
     
 def clean_fcst_data(filepaths):
-    
+
     dfs= []
     for i, filepath in enumerate(filepaths, 1):
-        df = pd.read_csv(filepath)
+        if filepath.endswith('.parquet'):
+            df = pd.read_parquet(filepath)
+        else:
+            df = pd.read_csv(filepath)
         dfs.append(df)
     #combine
     fcst_df = pd.concat(dfs,ignore_index=True)
@@ -612,7 +615,7 @@ def preprocess_pipeline():
     wind.to_parquet(interim / 'wind_cleaned.parquet') 
     del wind
 
-    fcst = clean_fcst_data(glob.glob(str(base / '*load_fcst_data*.csv')))
+    fcst = clean_fcst_data(glob.glob(str(base / '*load_fcst_data*.csv')) + glob.glob(str(base / '*load_fcst_data*.parquet')))
     fcst.to_parquet(interim / 'fcst_cleaned.parquet')
     del fcst
     
