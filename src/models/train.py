@@ -857,6 +857,8 @@ DROP_4CP = [
     'RT_price_ramp',
     'DAM_price_roll_mean_6h', 'DAM_price_roll_std_6h',
     'DAM_price_roll_mean_24h', 'DAM_price_roll_std_24h',
+    # Must drop: target label and temp columns added during training
+    'is_4cp_peak', 'year',
 ]
 
 

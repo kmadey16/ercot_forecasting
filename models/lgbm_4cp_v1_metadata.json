@@ -2,7 +2,7 @@
   "model_version": "v1",
   "model_type": "LGBMClassifier \u2014 4CP peak probability",
   "training_date": "2026-06-01",
-  "feature_count": 73,
+  "feature_count": 71,
   "features": [
     "hub_load",
     "load_total",
@@ -74,16 +74,14 @@
     "load_vs_monthly_max",
     "load_above_monthly_max",
     "load_fcst_vs_monthly_max",
-    "temp_roll_3h_max",
-    "year",
-    "is_4cp_peak"
+    "temp_roll_3h_max"
   ],
   "target": "is_4cp_peak (binary: 1 = hour contains monthly coincident peak)",
   "training_window": "June-Sept 2021-2023 (12 peaks)",
   "test_window": "June-Sept 2024-2025 (8 peaks)",
   "scale_pos_weight": 732,
-  "peaks_caught_top1": 7,
-  "peaks_caught_top3": 7,
+  "peaks_caught_top1": 0,
+  "peaks_caught_top3": 0,
   "total_test_peaks": 7,
   "transmission_rate_assumption": 45000,
   "lgbm_params": {

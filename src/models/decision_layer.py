@@ -313,6 +313,145 @@ def compare_strategies_datacenter(test_df, pred_price, pred_prc,
     return results
 
 
+def compare_strategies_4cp(test_df, p_4cp, intervals_df,
+                           capacity_mw=200, mining_revenue_per_mwh=40,
+                           transmission_rate=45000, verbose=True):
+    """Compare 4CP avoidance strategies.
+
+    Unlike curtailment backtests (which compare savings vs baselines), 4CP compares
+    PRECISION: everyone tries to dodge all peaks — the question is how many hours
+    you curtail to do it. Fewer hours = less lost production = more efficient.
+
+    Strategies:
+    - No management: run during all peaks, pay full transmission
+    - Conservative: curtail every summer afternoon 2-7 PM (what cautious operators do)
+    - Our model at various thresholds: curtail only when P(4CP) > threshold
+    - Oracle: curtail only the actual peak hours
+    """
+    bt = test_df[['timestamp', 'RT_price', 'month', 'hour']].copy()
+    bt['year'] = bt['timestamp'].dt.year
+    bt['p_4cp'] = p_4cp
+
+    # Label actual peaks
+    intervals_df = intervals_df.copy()
+    intervals_df['timestamp'] = pd.to_datetime(intervals_df['timestamp'])
+    bt['is_peak'] = bt['timestamp'].isin(intervals_df['timestamp']).astype(int)
+
+    # Only summer hours
+    summer = bt[bt['month'].isin([6, 7, 8, 9])].copy()
+    years = sorted(summer['year'].unique())
+
+    full_transmission = capacity_mw * transmission_rate  # annual bill if on during all peaks
+
+    if verbose:
+        print(f"\n{'='*75}")
+        print(f"4CP TRANSMISSION AVOIDANCE (200 MW, ${transmission_rate:,}/MW/yr)")
+        print(f"{'='*75}")
+        print(f"Full transmission bill if on during all peaks: ${full_transmission:,.0f}/year")
+
+    strategies = []
+
+    # 1. No management — run full load all summer
+    strategies.append({
+        'strategy': 'No 4CP management',
+        'hours_curtailed_per_summer': 0,
+        'peaks_dodged': 0,
+        'peaks_total': len(intervals_df[intervals_df['year'].isin(years)]),
+        'transmission_per_year': full_transmission,
+        'production_lost_per_summer': 0,
+        'net_cost_per_year': full_transmission,
+    })
+
+    # 2. Conservative — curtail every summer afternoon (2-7 PM weekdays)
+    afternoon_mask = (summer['hour'].between(14, 19))
+    afternoons_per_year = {}
+    for yr in years:
+        yr_mask = (summer['year'] == yr) & afternoon_mask
+        afternoons_per_year[yr] = yr_mask.sum()
+    avg_afternoons = sum(afternoons_per_year.values()) / len(years)
+
+    # Conservative catches all peaks (they always fall in this window)
+    strategies.append({
+        'strategy': 'Conservative (all afternoons)',
+        'hours_curtailed_per_summer': int(avg_afternoons),
+        'peaks_dodged': 4,
+        'peaks_total': 4,
+        'transmission_per_year': 0,
+        'production_lost_per_summer': int(avg_afternoons) * mining_revenue_per_mwh * capacity_mw,
+        'net_cost_per_year': int(avg_afternoons) * mining_revenue_per_mwh * capacity_mw,
+    })
+
+    # 3. Our model at various thresholds
+    for thresh in [0.01, 0.05, 0.10, 0.20, 0.50]:
+        total_curtailed = 0
+        total_peaks_dodged = 0
+        total_peaks = 0
+
+        for yr in years:
+            yr_summer = summer[summer['year'] == yr]
+            yr_curtail = yr_summer['p_4cp'] > thresh
+            yr_peaks = yr_summer['is_peak']
+
+            total_curtailed += yr_curtail.sum()
+            total_peaks += yr_peaks.sum()
+            total_peaks_dodged += (yr_curtail & (yr_peaks == 1)).sum()
+
+        n_years = len(years)
+        avg_curtailed = total_curtailed / n_years
+        avg_peaks_missed = (total_peaks - total_peaks_dodged) / n_years
+
+        # Transmission: based on average peaks missed across years
+        avg_4cp_demand = (avg_peaks_missed / 4) * capacity_mw
+        annual_transmission = avg_4cp_demand * transmission_rate
+        annual_production_lost = avg_curtailed * mining_revenue_per_mwh * capacity_mw
+
+        strategies.append({
+            'strategy': f'Model @{thresh:.2f}',
+            'hours_curtailed_per_summer': int(avg_curtailed),
+            'peaks_dodged': int(total_peaks_dodged),
+            'peaks_total': int(total_peaks),
+            'transmission_per_year': annual_transmission,
+            'production_lost_per_summer': annual_production_lost,
+            'net_cost_per_year': annual_transmission + annual_production_lost,
+        })
+
+    # 4. Oracle — curtail only actual peak hours
+    peaks_per_year = total_peaks / len(years)
+    strategies.append({
+        'strategy': 'Oracle (peak hours only)',
+        'hours_curtailed_per_summer': int(peaks_per_year),
+        'peaks_dodged': int(total_peaks),
+        'peaks_total': int(total_peaks),
+        'transmission_per_year': 0,
+        'production_lost_per_summer': int(peaks_per_year) * mining_revenue_per_mwh * capacity_mw,
+        'net_cost_per_year': int(peaks_per_year) * mining_revenue_per_mwh * capacity_mw,
+    })
+
+    results = pd.DataFrame(strategies)
+
+    if verbose:
+        print(f"\n{'Strategy':<30} {'Hrs/summer':>11} {'Peaks':>7} {'Transmission':>13} "
+              f"{'Lost prod':>11} {'Net cost/yr':>12}")
+        print('-' * 90)
+        for _, r in results.iterrows():
+            peaks_str = f"{r['peaks_dodged']}/{r['peaks_total']}"
+            print(f"{r['strategy']:<30} {r['hours_curtailed_per_summer']:>10,} {peaks_str:>7} "
+                  f"${r['transmission_per_year']:>11,.0f} "
+                  f"${r['production_lost_per_summer']:>9,.0f} "
+                  f"${r['net_cost_per_year']:>10,.0f}")
+
+        # Highlight the value
+        no_mgmt = results.iloc[0]['net_cost_per_year']
+        conservative = results.iloc[1]['net_cost_per_year']
+        best_model = results[results['strategy'].str.startswith('Model')].sort_values('net_cost_per_year').iloc[0]
+        print(f"\n--- Value of precision ---")
+        print(f"  vs no management:  save ${no_mgmt - best_model['net_cost_per_year']:>10,.0f}/year")
+        print(f"  vs conservative:   save ${conservative - best_model['net_cost_per_year']:>10,.0f}/year "
+              f"({int(results.iloc[1]['hours_curtailed_per_summer'] - best_model['hours_curtailed_per_summer'])} fewer hours curtailed)")
+
+    return results
+
+
 def optimize_price_threshold_datacenter(val_df, predicted_price, capacity_mw=200,
                                         critical_pct=0.65, curtailment_penalty=50,
                                         verbose=True):
