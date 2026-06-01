@@ -9,13 +9,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def load_models():
-    """Load all production models (PRC + price + spread)."""
+    """Load all production models (PRC + price + spread + 4CP)."""
     lr_1h = joblib.load(PROJECT_ROOT / 'models/lr_1h_prc_v2.pkl')
     lgbm_1h = joblib.load(PROJECT_ROOT / 'models/lgbm_1h_residual_v2.pkl')
     lr_24h = joblib.load(PROJECT_ROOT / 'models/lr_24h_prc_v2.pkl')
     price_1h = joblib.load(PROJECT_ROOT / 'models/lgbm_price_1h_v1.pkl')
     spread_24h = joblib.load(PROJECT_ROOT / 'models/lgbm_spread_24h_v1.pkl')
-    return lr_1h, lgbm_1h, lr_24h, price_1h, spread_24h
+    cp4 = joblib.load(PROJECT_ROOT / 'models/lgbm_4cp_v1.pkl')
+    return lr_1h, lgbm_1h, lr_24h, price_1h, spread_24h, cp4
 
 
 def load_thresholds():
@@ -30,6 +31,11 @@ def load_price_metadata():
 
 def load_spread_metadata():
     with open(PROJECT_ROOT / 'models/lgbm_spread_24h_v1_metadata.json', 'r') as f:
+        return json.load(f)
+
+
+def load_4cp_metadata():
+    with open(PROJECT_ROOT / 'models/lgbm_4cp_v1_metadata.json', 'r') as f:
         return json.load(f)
 
 
@@ -109,6 +115,24 @@ def advisory_24h(predicted_prc, predicted_rt_24h, dam_price, tight_threshold):
     return 'LOW RISK — standard scheduling'
 
 
+def predict_4cp(df, cp4_model, feature_cols):
+    """Predict 4CP peak probability.
+
+    Only meaningful for June-September, 2-7 PM. Outside this window, probability
+    is set to 0. Returns P(this hour is the monthly coincident peak).
+    """
+    proba = np.zeros(len(df))
+
+    # Only score summer afternoon hours
+    summer_mask = (df['month'].isin([6, 7, 8, 9])) & (df['hour'].between(14, 19))
+    if summer_mask.sum() > 0:
+        X = df.loc[summer_mask, feature_cols]
+        proba[summer_mask.values] = cp4_model.predict_proba(X)[:, 1]
+
+    df['p_4cp'] = proba
+    return df
+
+
 def dispatch_action(predicted_prc, predicted_price, tight_threshold,
                     price_threshold=None):
     """Combined Layer 1 + Layer 2 dispatch decision.
@@ -146,10 +170,11 @@ def dispatch_action(predicted_prc, predicted_price, tight_threshold,
 
 
 if __name__ == '__main__':
-    lr_1h, lgbm_1h, lr_24h, price_1h, spread_24h = load_models()
+    lr_1h, lgbm_1h, lr_24h, price_1h, spread_24h, cp4 = load_models()
     thresholds = load_thresholds()
     price_meta = load_price_metadata()
     spread_meta = load_spread_metadata()
+    cp4_meta = load_4cp_metadata()
 
     # Load PRC model feature lists from metadata
     with open(PROJECT_ROOT / 'models/lr_1h_prc_v2_metadata.json') as f:
@@ -183,6 +208,18 @@ if __name__ == '__main__':
     print('--- 1h Layer (Decision) ---')
     print(results[['timestamp', 'predicted_prc', 'predicted_regime',
                    'predicted_price', 'action']].tail(24))
+
+    # ── 4CP Layer (transmission charge avoidance) ────────────────
+    results = predict_4cp(results, cp4, cp4_meta['features'])
+
+    # Show 4CP alerts for summer afternoon hours
+    summer_risk = results[(results['is_4cp_season'] == 1) & (results['p_4cp'] > 0.01)]
+    if len(summer_risk) > 0:
+        print(f'\n--- 4CP Risk ({len(summer_risk)} flagged hours) ---')
+        print(summer_risk[['timestamp', 'p_4cp', 'load_total', 'temperature',
+                           'action']].tail(20))
+    else:
+        print('\n--- 4CP: No high-risk hours in current data (outside summer or no risk) ---')
 
     # ── 24h Layer (advisory/planning) ────────────────────────────
     results_24h = predict_prc(df_lr.copy(), lr_24h, feature_cols=prc_24h_features)

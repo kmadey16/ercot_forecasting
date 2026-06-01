@@ -175,6 +175,43 @@ def add_ordc_features(df):
     return df
 
 
+def add_4cp_features(df):
+    """Add features for 4CP (Four Coincident Peak) prediction.
+
+    4CP determines annual transmission charges: ERCOT identifies the single highest
+    15-min load interval in each summer month (June-Sept). An operator's demand during
+    those 4 intervals sets their transmission bill for the following year (~$42-76K/MW/yr).
+
+    The model needs to predict: "is this hour likely to be the monthly peak?"
+    Key signals: how close is current load to the monthly max so far, temperature,
+    time of day, and load forecast.
+    """
+    # Flag: are we in the 4CP window? (June-Sept, typical peak hours 14-19)
+    df['is_4cp_season'] = df['month'].isin([6, 7, 8, 9]).astype(int)
+    df['is_4cp_window'] = ((df['month'].isin([6, 7, 8, 9])) & (df['hour'].between(14, 19))).astype(int)
+
+    # Running monthly max load — the key signal. If current load is approaching
+    # or exceeding the monthly max so far, 4CP risk is high.
+    df['year'] = df['timestamp'].dt.year
+    df['monthly_load_max'] = df.groupby(['year', 'month'])['load_total'].cummax().shift(1)
+    df['load_vs_monthly_max'] = df['load_total'] / df['monthly_load_max']
+
+    # How far above/below the running max (in MW)
+    df['load_above_monthly_max'] = df['load_total'] - df['monthly_load_max']
+
+    # Load forecast vs running max — can we predict BEFORE the hour arrives?
+    df['load_fcst_vs_monthly_max'] = df['load_fcst_system'] / df['monthly_load_max']
+
+    # Temperature — extreme heat drives peak load
+    # Rolling 3h temperature trend (is it getting hotter?)
+    df['temp_roll_3h_max'] = df['temperature'].shift(1).rolling(3).max()
+
+    # Clean up temp column
+    df.drop(columns=['year'], inplace=True, errors='ignore')
+
+    return df
+
+
 # Add regime labels
 def add_regime_labels(df):
     bins = [0, 3000, 5000, 10000, float('inf')]
@@ -191,6 +228,7 @@ def feature_engineering_pipeline():
     df = add_rolling_stats(df)
     df = add_engineered_features(df)
     df = add_ordc_features(df)
+    df = add_4cp_features(df)
     df = add_regime_labels(df)
 
     # Drop lag warmup rows (first 168 hours)

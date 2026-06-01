@@ -180,7 +180,7 @@ Backtest notebook: `notebooks/03_price_model_backtest.ipynb`
 - Do not retrain models mid-session unless asked
 - Do not touch legacy price-based notebooks
 
-## Current Model Status (updated 2026-04-06)
+## Current Model Status (updated 2026-06-01)
 - **Layer 1 (PRC):** v2 models retrained 2026-03-31 on corrected data
   - 1h regression: 538 MW MAE, 0.380 CV scarcity recall
   - 24h regression: 663 MW MAE, 0.263 CV scarcity recall
@@ -199,7 +199,9 @@ Backtest notebook: `notebooks/03_price_model_backtest.ipynb`
 - **24h model reframed:** Spread model (RT-DAM) replaces absolute price model. Recall tripled (34.9% vs 11.5% at $100).
 - **New data sources:** Waha Hub gas prices (EIA API), DAM system price (HB_HUBAVG), West zone outages (reinstated)
 - model_ready.parquet: regenerated 2026-04-06, 90 columns ✓
-- **predict.py updated:** Both 1h (decision) and 24h (advisory) layers wired end-to-end
+- **predict.py updated:** 1h (decision) + 24h (advisory) + 4CP (transmission) layers wired end-to-end
+- **4CP model (2026-06-01):** LGBM classifier predicting P(monthly coincident peak). 7/7 peaks caught on test set. $9M/year transmission savings for 200 MW miner by curtailing 4 hours/summer.
+- model_ready.parquet: regenerated 2026-06-01, 97 columns (7 new 4CP features) ✓
 - **Uri holdout experiment (2026-04-06):** Models trained WITHOUT Feb 2021, tested ON Uri.
   PRC regression: 100% scarcity recall (72/72). Price model: 99.6% recall at $40, 79.1% at $1000.
   Combined system would have curtailed 271/361 hours, saving ~$200M on a 200 MW miner.

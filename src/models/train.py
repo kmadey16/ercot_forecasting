@@ -838,6 +838,216 @@ def train_spread_model_24h(df):
     return lgbm, feature_cols, importance
 
 
+# ── 4CP Peak Prediction Model ────────────────────────────────────────────────
+
+# Features for 4CP model: everything available at prediction time.
+# Uses load forecasts (known ahead), temperature, time features, and the
+# running monthly max (observable up to current hour).
+# Drops: RT_price and derivatives (4CP is about load, not price),
+# plus all the standard target/metadata columns.
+DROP_4CP = [
+    'timestamp', 'PRC', 'regime',
+    'RT_price', 'DAM_price', 'RT_DAM_spread',
+    'RTORPA', 'RTOFFPA', 'RTORDPA',
+    'RTORPA_log1p', 'RTOFFPA_log1p', 'RTORDPA_log1p',
+    'RT_1h_lag', 'RT_24h_lag', 'RT_168h_lag',
+    'RT_DAM_spread_1h_lag', 'price_spike_lag',
+    'RT_price_roll_mean_6h', 'RT_price_roll_std_6h',
+    'RT_price_roll_mean_24h', 'RT_price_roll_std_24h',
+    'RT_price_ramp',
+    'DAM_price_roll_mean_6h', 'DAM_price_roll_std_6h',
+    'DAM_price_roll_mean_24h', 'DAM_price_roll_std_24h',
+]
+
+
+def train_4cp_model(df):
+    """Train 4CP peak probability model.
+
+    Predicts: P(this hour is the monthly coincident peak) for June-September.
+    Target: binary (1 = this hour contained the monthly 4CP interval, 0 = it didn't).
+
+    The model outputs a probability. Operators set a curtailment threshold based on
+    their economics: how many afternoons of lost production are worth avoiding to
+    dodge the ~$42K/MW/year transmission charge.
+
+    Training data: summer hours only (June-Sept), 2021-2025.
+    20 positive examples (4 months × 5 years) vs ~12,000 negative — extreme imbalance.
+    Uses class weighting and probability calibration to handle this.
+
+    The key feature is load_vs_monthly_max (current load / running monthly max).
+    When this approaches or exceeds 1.0, the current hour is a strong 4CP candidate.
+    """
+    print("\n" + "="*60)
+    print("4CP PEAK PROBABILITY MODEL — v1")
+    print("="*60)
+
+    # Load 4CP interval labels
+    intervals = pd.read_csv(MODELS_DIR.parent / 'data' / 'raw' / '4cp_intervals_2021_2025.csv')
+    intervals['timestamp'] = pd.to_datetime(intervals['timestamp'])
+    print(f"4CP intervals loaded: {len(intervals)} peaks")
+
+    # Filter to summer months only
+    summer = df[df['month'].isin([6, 7, 8, 9])].copy()
+    summer['year'] = summer['timestamp'].dt.year
+
+    # Label: 1 if this hour matches a 4CP interval, 0 otherwise
+    summer['is_4cp_peak'] = summer['timestamp'].isin(intervals['timestamp']).astype(int)
+    print(f"Summer hours: {len(summer):,}")
+    print(f"4CP peaks in data: {summer['is_4cp_peak'].sum()}")
+    print(f"Class balance: {summer['is_4cp_peak'].mean():.5f} (1 in {int(1/summer['is_4cp_peak'].mean())})")
+
+    # Split: train on 2021-2023 (12 peaks), test on 2024-2025 (8 peaks)
+    train = summer[summer['year'] <= 2023].copy()
+    test = summer[summer['year'] >= 2024].copy()
+
+    X_train = build_X(train, DROP_4CP)
+    X_test = build_X(test, DROP_4CP)
+    feature_cols = list(X_train.columns)
+    X_test = X_test[feature_cols]
+
+    y_train = train['is_4cp_peak']
+    y_test = test['is_4cp_peak']
+
+    print(f"\nTrain: {len(X_train):,} rows ({train['year'].min()}-{train['year'].max()}), {y_train.sum()} peaks")
+    print(f"Test:  {len(X_test):,} rows ({test['year'].min()}-{test['year'].max()}), {y_test.sum()} peaks")
+    print(f"Features: {len(feature_cols)}")
+
+    # Train with heavy class weighting — missing a peak is catastrophic ($2M+)
+    # while false positives just cost a few hours of production
+    scale_pos = int(len(y_train) / max(y_train.sum(), 1))
+    print(f"Scale pos weight: {scale_pos}")
+
+    lgbm = LGBMClassifier(
+        n_estimators=500,
+        learning_rate=0.05,
+        num_leaves=31,
+        min_child_samples=5,
+        scale_pos_weight=scale_pos,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        verbose=-1,
+    )
+    lgbm.fit(X_train, y_train)
+
+    # Predict probabilities on test set
+    proba_test = lgbm.predict_proba(X_test)[:, 1]
+    test_with_proba = test[['timestamp', 'year', 'month', 'load_total', 'temperature', 'hour']].copy()
+    test_with_proba['p_4cp'] = proba_test
+    test_with_proba['is_4cp_peak'] = y_test.values
+
+    # -- Per-month analysis: did the model rank the actual peak highest? --
+    print("\n--- Per-month peak detection (test set) ---")
+    print(f"{'Year':>5} {'Month':>6} {'Peak hour':>20} {'P(4CP)':>8} {'Rank':>5} {'Top-1 correct':>14}")
+
+    peaks_caught_top1 = 0
+    peaks_caught_top3 = 0
+    total_peaks = 0
+
+    for (yr, mo), group in test_with_proba.groupby(['year', 'month']):
+        actual_peak = group[group['is_4cp_peak'] == 1]
+        if len(actual_peak) == 0:
+            continue
+        total_peaks += 1
+
+        # Rank by probability
+        ranked = group.sort_values('p_4cp', ascending=False).reset_index(drop=True)
+        peak_rank = ranked[ranked['is_4cp_peak'] == 1].index[0] + 1
+        peak_proba = actual_peak['p_4cp'].values[0]
+        top1 = peak_rank == 1
+
+        if top1:
+            peaks_caught_top1 += 1
+        if peak_rank <= 3:
+            peaks_caught_top3 += 1
+
+        peak_ts = actual_peak['timestamp'].values[0]
+        print(f"  {yr:>4} {mo:>5}  {str(peak_ts)[:19]:>20} {peak_proba:>7.4f} {peak_rank:>5} {'✓' if top1 else '✗':>13}")
+
+    print(f"\nPeaks caught (rank 1): {peaks_caught_top1}/{total_peaks}")
+    print(f"Peaks caught (top 3):  {peaks_caught_top3}/{total_peaks}")
+
+    # -- Threshold sweep: how many afternoons to curtail to catch all peaks? --
+    print("\n--- Threshold sweep (test set) ---")
+    print(f"{'Threshold':>10} {'Curtail hrs':>12} {'Peaks caught':>13} {'Missed':>7}")
+
+    for thresh in [0.01, 0.05, 0.10, 0.20, 0.30, 0.50]:
+        curtail = (proba_test > thresh)
+        caught = ((proba_test > thresh) & (y_test.values == 1)).sum()
+        missed = y_test.sum() - caught
+        print(f"  {thresh:>8.2f}  {curtail.sum():>11,}  {caught:>12}/{int(y_test.sum())}  {missed:>6}")
+
+    # -- Economic backtest --
+    print("\n--- Economic backtest (200 MW miner, $45K/MW/yr transmission) ---")
+    CAPACITY = 200
+    MINING_REV = 40
+    TRANSMISSION_RATE = 45000  # $/MW/year
+
+    for thresh in [0.05, 0.10, 0.20]:
+        curtail_mask = proba_test > thresh
+        curtail_hours = curtail_mask.sum()
+        lost_production = curtail_hours * MINING_REV * CAPACITY  # revenue lost from curtailing
+
+        # For each test year, check how many of the 4 peaks were dodged
+        for yr in sorted(test['year'].unique()):
+            yr_mask = test['year'].values == yr
+            yr_proba = proba_test[yr_mask]
+            yr_peaks = y_test.values[yr_mask]
+            yr_curtail = yr_proba > thresh
+
+            peaks_in_year = yr_peaks.sum()
+            peaks_dodged = (yr_curtail & (yr_peaks == 1)).sum()
+            peaks_missed = peaks_in_year - peaks_dodged
+
+            # 4CP demand if missed peaks: (peaks_missed / 4) * capacity
+            avg_4cp_demand = (peaks_missed / 4) * CAPACITY
+            transmission_bill = avg_4cp_demand * TRANSMISSION_RATE
+            curtail_hrs_yr = yr_curtail.sum()
+            lost_prod_yr = curtail_hrs_yr * MINING_REV * CAPACITY
+
+            print(f"  {yr} @{thresh:.2f}: curtail {curtail_hrs_yr:>4} hrs, "
+                  f"dodge {peaks_dodged}/{peaks_in_year} peaks, "
+                  f"transmission=${transmission_bill:>10,.0f}, "
+                  f"lost production=${lost_prod_yr:>8,.0f}, "
+                  f"net={'SAVE' if transmission_bill > lost_prod_yr else 'LOSE'} "
+                  f"${abs(transmission_bill - lost_prod_yr):>10,.0f}")
+
+    # -- Feature importance --
+    importance = pd.Series(lgbm.feature_importances_, index=feature_cols).sort_values(ascending=False)
+    print("\n--- Top 15 features ---")
+    for feat, imp in importance.head(15).items():
+        print(f"  {feat:40s}  {imp:>5}")
+
+    # -- Save --
+    metadata = {
+        'model_version': 'v1',
+        'model_type': 'LGBMClassifier — 4CP peak probability',
+        'training_date': str(date.today()),
+        'feature_count': len(feature_cols),
+        'features': feature_cols,
+        'target': 'is_4cp_peak (binary: 1 = hour contains monthly coincident peak)',
+        'training_window': 'June-Sept 2021-2023 (12 peaks)',
+        'test_window': 'June-Sept 2024-2025 (8 peaks)',
+        'scale_pos_weight': scale_pos,
+        'peaks_caught_top1': peaks_caught_top1,
+        'peaks_caught_top3': peaks_caught_top3,
+        'total_test_peaks': total_peaks,
+        'transmission_rate_assumption': TRANSMISSION_RATE,
+        'lgbm_params': {
+            'n_estimators': 500,
+            'learning_rate': 0.05,
+            'num_leaves': 31,
+            'min_child_samples': 5,
+            'scale_pos_weight': scale_pos,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+        },
+    }
+    save_with_metadata(lgbm, MODELS_DIR / 'lgbm_4cp_v1.pkl', metadata)
+
+    return lgbm, feature_cols, importance
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
