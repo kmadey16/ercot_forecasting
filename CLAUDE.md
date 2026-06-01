@@ -200,7 +200,7 @@ Backtest notebook: `notebooks/03_price_model_backtest.ipynb`
 - **New data sources:** Waha Hub gas prices (EIA API), DAM system price (HB_HUBAVG), West zone outages (reinstated)
 - model_ready.parquet: regenerated 2026-04-06, 90 columns ✓
 - **predict.py updated:** 1h (decision) + 24h (advisory) + 4CP (transmission) layers wired end-to-end
-- **4CP model (2026-06-01):** LGBM classifier predicting P(monthly coincident peak). 7/7 peaks caught on test set. $9M/year transmission savings for 200 MW miner by curtailing 4 hours/summer.
+- **4CP model (2026-06-01):** LGBM classifier predicting P(4CP peak day). Initial attempt had target leakage (fake 7/7 result). After fix: 2/8 peaks caught at usable thresholds. 12 training examples limits ML reliability. Day-level model with 15-min load data is best attempt so far. Conservative rule-based approach (curtail ~50 afternoons) currently more cost-effective.
 - model_ready.parquet: regenerated 2026-06-01, 97 columns (7 new 4CP features) ✓
 - **Uri holdout experiment (2026-04-06):** Models trained WITHOUT Feb 2021, tested ON Uri.
   PRC regression: 100% scarcity recall (72/72). Price model: 99.6% recall at $40, 79.1% at $1000.

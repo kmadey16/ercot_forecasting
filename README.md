@@ -62,8 +62,8 @@ The models detected an event type they had never seen. Regression + thresholds e
       ↳ Either signal fires → take the more aggressive action
 
 4CP LAYER — TRANSMISSION (June-Sept, avoids annual charges)
-  └─ 4CP model:   P(monthly peak) > threshold → CURTAIL this hour
-      ↳ 4 hours/summer of curtailment avoids ~$9M/year in transmission
+  └─ 4CP model:   P(peak day) > threshold → CURTAIL afternoon window
+      ↳ Reduces curtailment from ~50 afternoons to ~10 (work in progress)
 
 24h LAYER — ADVISORY (informs scheduling, no auto-curtailment)
   ├─ PRC model:         next-day reserve risk
@@ -79,7 +79,7 @@ The 1h layer drives real-time curtailment. The 4CP layer drives summer transmiss
 |-------|------|------------|------|
 | 1h PRC | LR + LGBM ensemble | 538 MW MAE, 100% Uri recall | Safety net for grid emergencies |
 | 1h Price | LGBM regressor | 88% recall @ $100, 89% precision | Primary economic driver |
-| 4CP Peak | LGBM classifier | 7/7 peaks caught, rank 1 | Transmission charge avoidance |
+| 4CP Risk | LGBM classifier | Day-level peak risk (in progress) | Transmission charge avoidance |
 | 24h PRC | Linear Regression | 663 MW MAE | Next-day reserve planning |
 | 24h Spread | LGBM regressor | Predicts RT-DAM deviation | Early warning (advisory) |
 
@@ -87,9 +87,9 @@ The 1h layer drives real-time curtailment. The 4CP layer drives summer transmiss
 
 ## Use Cases
 
-**Bitcoin Mining** (200 MW, binary on/off, $40/MWh revenue): The 1h price model is the primary real-time decision (+$3.8M vs DAM-only baseline). The 4CP model adds **~$9M/year** in transmission charge avoidance by curtailing just 4 hours per summer instead of 50+.
+**Bitcoin Mining** (200 MW, binary on/off, $40/MWh revenue): The 1h price model is the primary real-time decision (+$3.8M vs DAM-only baseline). 4CP avoidance (~$9M/year potential) is in development — 12 training examples makes reliable ML prediction challenging; conservative rule-based approach currently more cost-effective.
 
-**AI Datacenter** (200 MW, 65% critical / 35% flexible, $50/MWh SLA penalty): Two-layer workflow — read DAM prices + 24h PRC to pre-migrate flexible workloads overnight, then let the 1h layer handle real-time surprises. **+$700K vs DAM-only** over 18 months. 4CP avoidance adds further annual transmission savings.
+**AI Datacenter** (200 MW, 65% critical / 35% flexible, $50/MWh SLA penalty): Two-layer workflow — read DAM prices + 24h PRC to pre-migrate flexible workloads overnight, then let the 1h layer handle real-time surprises. **+$700K vs DAM-only** over 18 months.
 
 **Battery Storage** (planned): Not curtailment — arbitrage. Buy low, sell high, bid ancillary services. Same model inputs, different decision layer (state-of-charge optimization).
 
@@ -142,7 +142,7 @@ Requires `.env` with `GRIDSTATUS_API_KEY` and `EIA_API_KEY`.
 
 - [x] Layer 1: PRC models (1h + 24h) — grid-wide reserve forecasting
 - [x] Layer 2: Price models (1h absolute + 24h spread) — local congestion detection
-- [x] 4CP peak prediction — transmission charge avoidance ($9M/year, 7/7 peaks caught)
+- [ ] 4CP peak prediction — transmission charge avoidance ($9M/year potential, model in progress — 12 training examples limits ML reliability)
 - [x] Economic backtest: realistic baselines (DAM-only, RT lag-react) with dollar-denominated savings
 - [x] Extreme event validation: Uri holdout proving robustness to unseen events
 - [x] Post-RTC+B pipeline: handles ERCOT market redesign (Dec 2025) seamlessly
