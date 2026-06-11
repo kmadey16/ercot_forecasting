@@ -4,11 +4,13 @@
 
 ERCOT's Physical Responsive Capability (PRC) measures system-wide reserve levels — but West Texas (HB_WEST) prices spike from local congestion even when reserves are comfortable. A 200 MW Bitcoin miner paying $100+/MWh during those hours loses $61M over 5 years. This system predicts both grid-wide stress and local price spikes, triggering curtailment before the cost hits.
 
+Runs end-to-end on Databricks: medallion architecture, 97 features, models versioned in MLflow, scored predictions written to Delta.
+
 ## The Edge
 
 Most approaches predict either grid reserves or electricity price. Neither alone works:
 
-- **PRC-only** catches system-wide emergencies (Uri, statewide heat) but misses congestion. During our 18-month test window, PRC-only saved **$22K**. The price model saved **$17.2M**. During this window there were zero system-wide scarcity events — congestion-driven spikes were the entire story. PRC is the safety net for Uri-type events; price is the daily P&L driver.
+- **PRC-only** catches system-wide emergencies (Uri, statewide heat) but misses congestion. During our 17-month test window, PRC-only saved **$973K** (5.4% of oracle). The price model saved **$18.0M** (99.7%). Most high-price hours are driven by local congestion, not system-wide scarcity. PRC is the safety net for Uri-type events; price is the daily P&L driver.
 - **Price-only** catches congestion but can't see system-wide emergencies 24h ahead.
 
 This system runs both in parallel. Either signal triggers curtailment. In backtest: **99.7% of perfect-foresight savings within this test window** for a 200 MW mining operation.
@@ -36,8 +38,8 @@ This system runs both in parallel. Either signal triggers curtailment. In backte
 | Oracle @>$143 | $2.4M | 100% |
 
 **Incremental value vs what operators already do:**
-- vs DAM-only: **+$3.7M** more over 18 months (26% improvement)
-- vs reacting to last hour's RT price: **+$2.2M** more (14% improvement)
+- vs DAM-only: **+$3.7M** over 17 months (26% improvement)
+- vs reacting to last hour's RT price: **+$2.2M** (14% improvement)
 - Combined system has **91 false positive hours** ($28K lost) vs **911 false positives** for DAM-only ($2.0M lost) — 10x fewer bad calls
 
 Assumes signal received at hour start, curtailment executable within 15 minutes, no ramp constraints modeled.
@@ -87,9 +89,9 @@ The 1h layer drives real-time curtailment. The 4CP layer drives summer transmiss
 
 ## Use Cases
 
-**Bitcoin Mining** (200 MW, binary on/off, $40/MWh revenue): The 1h price model is the primary real-time decision (+$3.8M vs DAM-only baseline). 4CP avoidance (~$9M/year potential) is in development — 12 training examples makes reliable ML prediction challenging; conservative rule-based approach currently more cost-effective.
+**Bitcoin Mining** (200 MW, binary on/off, $40/MWh revenue): The 1h price model is the primary real-time decision (+$3.7M vs DAM-only baseline). 4CP avoidance (~$9M/year potential) is in development — 12 training examples makes reliable ML prediction challenging; conservative rule-based approach currently more cost-effective.
 
-**AI Datacenter** (200 MW, 65% critical / 35% flexible, $50/MWh SLA penalty): Two-layer workflow — read DAM prices + 24h PRC to pre-migrate flexible workloads overnight, then let the 1h layer handle real-time surprises. **+$700K vs DAM-only** over 18 months.
+**AI Datacenter** (200 MW, 65% critical / 35% flexible, $50/MWh SLA penalty): Two-layer workflow — read DAM prices + 24h PRC to pre-migrate flexible workloads overnight, then let the 1h layer handle real-time surprises. **+$745K vs DAM-only** over 17 months.
 
 **Battery Storage** (planned): Not curtailment — arbitrage. Buy low, sell high, bid ancillary services. Same model inputs, different decision layer (state-of-charge optimization).
 
@@ -136,17 +138,19 @@ GOLD (ML-ready)
   │                                   regime labels, 4CP indicators)
   └─ ercot.gold.model_ready        → final Delta table for training/scoring
 
-MODELS (MLflow Registry)
+MODELS (MLflow Registry — 5 production models)
   ├─ 05_model_training             → train all models, log to MLflow
   │   ├─ ercot-prc-1h-lr           → 1h PRC Linear Regression
   │   ├─ ercot-prc-1h-lgbm        → 1h PRC LGBM residual
   │   ├─ ercot-prc-24h            → 24h PRC Linear Regression
   │   ├─ ercot-price-1h           → 1h Price LGBM
-  │   ├─ ercot-spread-24h         → 24h RT-DAM Spread LGBM
-  │   └─ ercot-4cp-peak           → 4CP peak classifier (in progress)
+  │   └─ ercot-spread-24h         → 24h RT-DAM Spread LGBM
   ├─ 06_backtest                   → realistic baseline comparison
   └─ 07_scoring                    → production scoring pipeline
         └─ ercot.gold.predictions  → scored output Delta table
+
+PLANNED: 4CP peak prediction (not yet production-ready — 12 training examples,
+         settlement-adjusted load not reproducible in real-time)
 ```
 
 Models are versioned in MLflow with parameters, metrics, and artifacts tracked per run. Scoring loads models from the registry and writes predictions back to Delta.
