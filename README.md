@@ -105,7 +105,7 @@ The 1h layer drives real-time curtailment. The 4CP layer drives summer transmiss
 
 ## Data Pipeline
 
-Six data sources, automated ingestion, 90 engineered features:
+Six data sources, automated ingestion, 97 engineered features:
 
 ```
 ERCOT MIS (CSV)     → load, wind, solar, outages, RT/DAM prices (2021–2026)
@@ -114,26 +114,53 @@ gridstatus (open)   → DAM system price for congestion spread
 Open-Meteo API      → weather (temperature, humidity, wind, precipitation)
 EIA API             → Waha Hub natural gas daily spot price
 ERCOT xlsx archives → pre-RTC+B PRC + ORDC adders (2021–Nov 2025)
-
-    ↓ preprocess.py (clean, merge, handle schema differences)
-    ↓ feature_engineering.py (90 features: lags, rolling stats, spreads, ratios)
-    ↓ model_ready.parquet (45,000+ hourly rows)
-    ↓ predict.py (1h decisions + 24h advisories)
 ```
+
+## Databricks Deployment
+
+The full pipeline runs on Databricks with medallion architecture:
+
+```
+BRONZE (raw ingestion)
+  └─ CSV/xlsx/parquet files → Delta tables via Unity Catalog
+
+SILVER (cleaning + transformation)
+  ├─ 01_bronze_to_silver_ingest    → raw files to Delta tables
+  └─ 02_silver_cleaning_backfill   → timestamp alignment, HB_WEST filtering,
+                                      hour-ending fixes, ORDC/PRC extraction,
+                                      weather API pull, deduplication
+
+GOLD (ML-ready)
+  ├─ 03_gold_merge                 → join all silver tables on timestamp
+  ├─ 04_gold_features              → 97 features (lags, rolling stats, spreads,
+  │                                   regime labels, 4CP indicators)
+  └─ ercot.gold.model_ready        → final Delta table for training/scoring
+
+MODELS (MLflow Registry)
+  ├─ 05_model_training             → train all models, log to MLflow
+  │   ├─ ercot-prc-1h-lr           → 1h PRC Linear Regression
+  │   ├─ ercot-prc-1h-lgbm        → 1h PRC LGBM residual
+  │   ├─ ercot-prc-24h            → 24h PRC Linear Regression
+  │   ├─ ercot-price-1h           → 1h Price LGBM
+  │   ├─ ercot-spread-24h         → 24h RT-DAM Spread LGBM
+  │   └─ ercot-4cp-peak           → 4CP peak classifier (in progress)
+  ├─ 06_backtest                   → realistic baseline comparison
+  └─ 07_scoring                    → production scoring pipeline
+        └─ ercot.gold.predictions  → scored output Delta table
+```
+
+Models are versioned in MLflow with parameters, metrics, and artifacts tracked per run. Scoring loads models from the registry and writes predictions back to Delta.
 
 ## How to Run
 
-```bash
-# Pull new data (weekly)
-python -c "from src.data.gridstatus_ingest import pull_new_data; pull_new_data('2026-04-01', '2026-04-07')"
+**On Databricks:** Run notebooks 01→07 in sequence, or schedule as a Workflow.
 
-# Preprocess → features → score
+**Locally:**
+```bash
+python -c "from src.data.gridstatus_ingest import pull_new_data; pull_new_data('2026-04-01', '2026-04-07')"
 python src/data/preprocess.py
 python src/features/feature_engineering.py
 python -m src.models.predict
-
-# Retrain (when drift detected)
-python src/models/train.py
 ```
 
 Requires `.env` with `GRIDSTATUS_API_KEY` and `EIA_API_KEY`.
@@ -142,16 +169,16 @@ Requires `.env` with `GRIDSTATUS_API_KEY` and `EIA_API_KEY`.
 
 - [x] Layer 1: PRC models (1h + 24h) — grid-wide reserve forecasting
 - [x] Layer 2: Price models (1h absolute + 24h spread) — local congestion detection
-- [ ] 4CP peak prediction — transmission charge avoidance ($9M/year potential, model in progress — 12 training examples limits ML reliability)
+- [ ] 4CP peak prediction — $9M/year potential, limited by 12 training examples and settlement-adjusted load gap
 - [x] Economic backtest: realistic baselines (DAM-only, RT lag-react) with dollar-denominated savings
 - [x] Extreme event validation: Uri holdout proving robustness to unseen events
 - [x] Post-RTC+B pipeline: handles ERCOT market redesign (Dec 2025) seamlessly
-- [ ] **Databricks migration** — Delta Lake, MLflow, Workflows (in progress)
+- [x] **Databricks migration** — Delta Lake medallion architecture, MLflow model registry, 7 notebooks end-to-end
+- [ ] **Databricks Workflows** — scheduled orchestration of the pipeline
+- [ ] **Lakehouse Monitoring** — automated drift detection on predictions table
 - [ ] **Multi-agent system** — autonomous data/feature/model/synthesis agents
-- [ ] **Deployment** — always-on server + Telegram real-time alerts
-- [ ] **MLOps** — automated retraining, drift detection, model versioning
 - [ ] **Battery arbitrage** — AS price model + state-of-charge optimizer
 
 ## Tech Stack
 
-Python 3.12 | scikit-learn | LightGBM | pandas | gridstatus | GridStatus.io API | Open-Meteo API | EIA API | joblib
+Python 3.12 | Databricks (Delta Lake, MLflow, Unity Catalog) | scikit-learn | LightGBM | PySpark | pandas | gridstatus | GridStatus.io API | Open-Meteo API | EIA API
